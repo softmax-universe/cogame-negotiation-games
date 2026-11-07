@@ -1,8 +1,8 @@
 # Negotiation Games
 
 A **three-seat bargaining table** for the Softmax Coworld platform, on the
-[cogame-parley](https://github.com/Metta-AI/cogame-parley) technology stack
-(forked from [cogame-babel](https://github.com/Metta-AI/cogame-babel)). A
+[cogame-parley](https://github.com/softmax-universe/cogame-parley) technology stack
+(forked from [cogame-babel](https://github.com/softmax-universe/cogame-babel)). A
 port of OpenSpiel's `bargaining` (Lewis et al. 2017 / DeepMind).
 
 Three cogs, six one-on-one matches. Each match puts a pool of **books, hats
@@ -64,7 +64,7 @@ if the play clock stops it between matches, `deadline`.
 - `tools/ci/` — the CI harness (docker smoke, viewer smoke, manifest, chrome
   and replay gates)
 - `data/` — cog sprites and art, borrowed from
-  [coworld-ctf](https://github.com/Metta-AI/coworld-ctf) (MIT)
+  [coworld-ctf](https://github.com/softmax-universe/coworld-ctf) (MIT)
 - `docs/plans/` — the design note this game was built from
 
 ## Fielding a policy

@@ -11,7 +11,7 @@ import json
 import pathlib
 
 IMAGE = "{{GAME_IMAGE}}"
-SOURCE = "https://github.com/Metta-AI/cogame-negotiation-games/tree/main"
+SOURCE = "https://github.com/softmax-universe/cogame-negotiation-games/tree/main"
 SEATS = 3
 
 DESCRIPTION = (
