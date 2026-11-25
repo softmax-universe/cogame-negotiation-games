@@ -271,11 +271,18 @@ suite "18. strict reply parsing":
       expect NegotiationError:
         discard parseAction(sim, parseJson(invalid))
 
-  test "parseJsonObject requires a single JSON object with no fences or prose":
+  test "parseJsonObject accepts a bare JSON object or single markdown fence":
     let clean = parseJsonObject("""  {"action":"accept","message":"ok"}  """)
     check clean["action"].getStr() == "accept"
+    let fencedJson = parseJsonObject("```json\n{\"action\":\"accept\",\"message\":\"ok\"}\n```")
+    check fencedJson["action"].getStr() == "accept"
+    let fencedBare = parseJsonObject("  ```\n{\"action\":\"offer\",\"take\":{\"books\":1,\"hats\":0,\"balls\":0}}\n```  ")
+    check fencedBare["action"].getStr() == "offer"
     for invalid in [
-      "```json\n{\"action\":\"accept\",\"message\":\"ok\"}\n```",
+      "Here is my offer:\n```json\n{\"action\":\"accept\"}\n```",
+      "```json\n{\"action\":\"accept\"}\n```\nextra prose",
+      "```python\n{\"action\":\"accept\"}\n```",
+      "```json\n{\"action\":\"accept\"}\n```\n```json\n{\"action\":\"accept\"}\n```",
       "Here is my offer: {\"action\":\"offer\",\"take\":{\"books\":1,\"hats\":0,\"balls\":0}}",
       "{\"action\":\"accept\"} trailing prose",
       "I accept your generous offer.",

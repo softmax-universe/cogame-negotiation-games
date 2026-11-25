@@ -56,7 +56,7 @@ type
     bedrockModels: seq[string]
     bedrockModel: int
     bedrockToken: string
-    model: string
+    model*: string
     maxOutputTokens: int
     timeoutSeconds: int
     disabled*: bool   ## true once credentials are known-unavailable
@@ -85,34 +85,14 @@ proc resolveApiKey(): string =
     echo "negotiation llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id; without it, fall through this list — model access is
-  ## a per-account Marketplace subscription, so an id that works in one
-  ## account 403s in another. Haiku leads: hosted Bedrock capacity is shared
-  ## account-wide and the sonnet profiles run out of daily tokens first.
+proc bedrockModelId(): string =
   let pinned = getEnv("BEDROCK_MODEL").strip()
   if pinned.len > 0:
-    return @[pinned]
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-6",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "negotiation llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
+    return pinned
+  "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+  client.bedrockEndpoint & "/model/" & client.bedrockModels[0] & "/invoke"
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -125,7 +105,8 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   if sidecarEndpoint.len > 0:
     result.transport = ltSidecar
     result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
-    result.model = getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
+    let envModel = getEnv("COWORLD_LLM_MODEL").strip()
+    result.model = if envModel.len > 0: envModel else: "anthropic/claude-haiku-4.5"
     result.curl = newCurly()
     return
   let bedrockEndpoint = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").strip()
@@ -138,7 +119,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.bedrockModels = @[bedrockModelId()]
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "negotiation llm: bedrock transport, url ", result.bedrockUrl
@@ -441,9 +422,33 @@ proc parseAction*(sim: Sim, payload: JsonNode): Decision =
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
-proc parseJsonObject*(text: string): JsonNode =
-  ## Parses a single JSON object reply with no surrounding prose or fences.
+proc stripSingleMarkdownFence(text: string): string =
+  ## Unwraps at most one outer Markdown presentation fence (``` or ```json)
+  ## when the entire reply is fenced, rejecting surrounding prose or multiple fences.
   let trimmed = text.strip()
+  if not trimmed.startsWith("```"):
+    return trimmed
+  let firstNewline = trimmed.find('\n')
+  if firstNewline < 0:
+    raise newException(NegotiationError, "unterminated markdown fence")
+  let opening = trimmed[3 ..< firstNewline].strip().toLowerAscii()
+  if opening.len > 0 and opening != "json":
+    raise newException(NegotiationError, "unsupported markdown fence language: " & opening)
+  let rest = trimmed[firstNewline + 1 .. ^1].strip(leading = false, trailing = true)
+  if not rest.endsWith("```"):
+    raise newException(NegotiationError, "unterminated markdown fence")
+  let closeStart = rest.len - 3
+  if closeStart == 0 or rest[closeStart - 1] != '\n':
+    raise newException(NegotiationError, "closing markdown fence must be on its own line")
+  let inner = rest[0 ..< closeStart].strip()
+  if "```" in inner:
+    raise newException(NegotiationError, "multiple markdown fences are not permitted")
+  inner
+
+proc parseJsonObject*(text: string): JsonNode =
+  ## Parses a single JSON object reply, optionally wrapped in a single
+  ## Markdown presentation fence, with no surrounding prose.
+  let trimmed = stripSingleMarkdownFence(text)
   if trimmed.len == 0 or trimmed[0] != '{' or trimmed[^1] != '}':
     let head = capRunes(trimmed.replace("\n", " "), 160)
     raise newException(NegotiationError, "reply must be a single JSON object: " & head)
@@ -452,7 +457,7 @@ proc parseJsonObject*(text: string): JsonNode =
     raise newException(NegotiationError, "reply must be a JSON object")
   node
 
-proc completeText(client: LlmClient, system, user: string, slot: int, evidence: var DecisionAttempt): string =
+proc completeText*(client: LlmClient, system, user: string, slot: int, evidence: var DecisionAttempt): string =
   var body = %*{
     "max_tokens": client.maxOutputTokens,
     "temperature": 0,
@@ -487,19 +492,14 @@ proc completeText(client: LlmClient, system, user: string, slot: int, evidence: 
   captureInferenceResponse(evidence, response.body, response.code,
     response.headers["x-softmax-llm-call-id"], response.headers["x-coworld-checkpoint-sha256"],
     response.headers["x-coworld-tokenizer-sha256"], response.headers["x-coworld-chat-template-sha256"],
-    client.timeoutSeconds, 2)
+    client.timeoutSeconds, 1)
   if response.code == 401 or response.code == 403:
     let detail = capRunes(response.body, 400)
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(NegotiationError,
-        "bedrock model access denied: " & detail)
     client.disabled = true
     raise newException(NegotiationError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = capRunes(response.body, 300)
-    discard client.tryNextBedrockModel("throttled")
     raise newException(NegotiationError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
     raise newException(NegotiationError, "anthropic error " & $response.code &
@@ -529,8 +529,8 @@ proc decide*(
   scripted: string
 ): Decision =
   ## One decision for one seat. Explicit scripted seats run their chosen
-  ## baseline; model seats either return a valid legal model decision or
-  ## raise PolicyFailureError with all failed attempts preserved.
+  ## baseline; model seats make a single model call and either return a valid
+  ## legal decision or raise PolicyFailureError with the raw attempt preserved.
   if scripted.len > 0:
     return scriptedDecision(sim, parseBaseline(scripted))
   if client.disabled:
@@ -540,44 +540,32 @@ proc decide*(
       asMissing
     )
   let system = systemPrompt(selection, sim, call.seat)
-  var retained: seq[DecisionAttempt]
-  var lastError = "model failed to produce a valid action"
-  for attempt in 0 .. 1:
-    var evidence = newDecisionAttempt("attempt-" & $attempt, client.model, aoModel)
-    var raw = ""
-    try:
-      var decision: Decision
-      var user = userPrompt(sim, call.seat, prompt)
-      if attempt > 0:
-        user.add(RetryHint)
-      raw = client.completeText(system, user, call.seat, evidence)
-      let payload = parseJsonObject(raw)
-      decision = parseAction(sim, payload)
-      ## Reject illegal replies here so the retry carries the hint.
-      var probe = sim
-      if decision.action == "accept":
-        probe.applyAccept(call.match, decision.message, decision.notes, false)
-      else:
-        probe.applyOffer(call.match, decision.take, decision.message,
-          decision.notes, false)
-      evidence.response = %raw
-      evidence.accepted = true
-      decision.nativeAttempts = retained & @[evidence]
-      return decision
-    except CatchableError as error:
-      lastError = error.msg
-      evidence.response = %raw
-      evidence.rejectionReason = some(error.msg)
-      retained.add(evidence)
-      echo "negotiation llm: seat ", call.seat, " attempt ", attempt,
-        " failed: ", error.msg
-      if client.disabled:
-        break
-  raise newPolicyFailure(
-    "seat " & $call.seat & " model decision failed: " & lastError,
-    retained,
-    asRejected
-  )
+  let user = userPrompt(sim, call.seat, prompt)
+  var evidence = newDecisionAttempt("attempt-0", client.model, aoModel)
+  var raw = ""
+  try:
+    raw = client.completeText(system, user, call.seat, evidence)
+    let payload = parseJsonObject(raw)
+    var decision = parseAction(sim, payload)
+    var probe = sim
+    if decision.action == "accept":
+      probe.applyAccept(call.match, decision.message, decision.notes, false)
+    else:
+      probe.applyOffer(call.match, decision.take, decision.message,
+        decision.notes, false)
+    evidence.response = %raw
+    evidence.accepted = true
+    decision.nativeAttempts = @[evidence]
+    return decision
+  except CatchableError as error:
+    evidence.response = %raw
+    evidence.rejectionReason = some(error.msg)
+    echo "negotiation llm: seat ", call.seat, " failed: ", error.msg
+    raise newPolicyFailure(
+      "seat " & $call.seat & " model decision failed: " & error.msg,
+      @[evidence],
+      asRejected
+    )
 
 
 proc decisionJson*(decision: Decision): JsonNode =

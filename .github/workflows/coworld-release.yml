@@ -163,12 +163,37 @@ jobs:
         run: |
           set -euo pipefail
           echo "Certify locally" > "$RR/current_step"
+          # Credential-free local certification fixture ONLY; its endpoint NEVER
+          # enters dist/coworld_manifest.json or the published manifest.
+          python3 tools/ci/mock_llm_server.py --host 0.0.0.0 --port 18089 >"$RR/mock_llm.log" 2>&1 &
+          MOCK_PID=$!
+          trap 'kill "${MOCK_PID}" 2>/dev/null || true; rm -f dist/certify_manifest.json' EXIT
+          for _ in $(seq 1 40); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:18089/healthz"; then break; fi
+            sleep 0.1
+          done
+          DOCKER_GW="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+          if [ -z "${DOCKER_GW}" ]; then
+            DOCKER_GW="172.17.0.1"
+          fi
+          python3 - dist/coworld_manifest.json dist/certify_manifest.json "http://${DOCKER_GW}:18089" <<'PY'
+          import json, sys
+          src, dst, endpoint = sys.argv[1:4]
+          doc = json.load(open(src))
+          assert "COWORLD_LLM_ENDPOINT" not in json.dumps(doc), "published manifest must not contain COWORLD_LLM_ENDPOINT"
+          for entry in doc.get("player") or []:
+              env = entry.setdefault("env", {})
+              if env.get("COWORLD_LLM_ENABLED") == "true":
+                  env["COWORLD_LLM_ENDPOINT"] = endpoint
+          json.dump(doc, open(dst, "w"), indent=2)
+          PY
           set +e
-          uvx --from "$COWORLD_PKG" coworld certify dist/coworld_manifest.json \
+          uvx --from "$COWORLD_PKG" coworld certify dist/certify_manifest.json \
             --no-open-report \
             2>&1 | tee "$RR/certify.log"
           rc="${PIPESTATUS[0]}"
           set -e
+          rm -f dist/certify_manifest.json
           python3 - "$RR" "$rc" "$LIVENESS_MARKER" <<'PY'
           import json, sys
           rr, rc, marker = sys.argv[1], int(sys.argv[2]), sys.argv[3]

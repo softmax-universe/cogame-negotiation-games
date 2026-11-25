@@ -691,10 +691,33 @@ proc websocketHandler(
         if frameType == "register":
           if payload{"control"}.getStr() != "external":
             raise newException(NegotiationError, "unknown player control")
+          let prompt = cleanPrompt(payload{"prompt"}.getStr())
           withLock stateLock:
+            state.prompts[slot] = prompt
+            state.scripted[slot] = ""
             state.external[slot] = true
             state.registered[slot] = true
             state.registrationError[slot] = ""
+          return
+        if frameType == "action_failed":
+          withLock stateLock:
+            if state.external[slot] and state.awaitingSeat == slot and
+                payload.hasKey("event") and payload["event"].kind == JInt and
+                state.awaitingEvent == payload["event"].getInt():
+              var attempts: seq[DecisionAttempt]
+              if payload.hasKey("attempts") and payload["attempts"].kind == JArray:
+                for attempt in payload["attempts"]:
+                  try:
+                    attempts.add(readAttemptEvidence(attempt))
+                  except CatchableError:
+                    discard
+              let reason = payload{"reason"}.getStr("external player decision failed")
+              let statusText = payload{"status"}.getStr("rejected")
+              state.pendingFailure = reason
+              state.pendingFailureAttempts = attempts
+              state.pendingFailureStatus =
+                if statusText == "missing": asMissing else: asRejected
+              state.hasPendingFailure = true
           return
         if frameType == "action":
           withLock stateLock:
