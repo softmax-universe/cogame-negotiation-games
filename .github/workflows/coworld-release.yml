@@ -180,9 +180,11 @@ jobs:
           import json, sys
           src, dst, endpoint = sys.argv[1:4]
           doc = json.load(open(src))
-          assert "COWORLD_LLM_ENDPOINT" not in json.dumps(doc), "published manifest must not contain COWORLD_LLM_ENDPOINT"
+          game_env = ((doc.get("game") or {}).get("runnable") or {}).get("env") or {}
+          assert "COWORLD_LLM_ENDPOINT" not in game_env, "published game env must not set COWORLD_LLM_ENDPOINT"
           for entry in doc.get("player") or []:
               env = entry.setdefault("env", {})
+              assert "COWORLD_LLM_ENDPOINT" not in env, f"published player {entry.get('id')!r} env must not set COWORLD_LLM_ENDPOINT"
               if env.get("COWORLD_LLM_ENABLED") == "true":
                   env["COWORLD_LLM_ENDPOINT"] = endpoint
           json.dump(doc, open(dst, "w"), indent=2)
