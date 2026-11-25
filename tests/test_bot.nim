@@ -2,12 +2,13 @@ import negotiation/prompts
 ## Scripted-baseline and reply-parsing tests — design note §Tests items
 ## 14-19.
 ##
-## The baselines are both the no-credentials fallback (offline
-## certification) and fieldable policies, so this is the completion path:
-## every order they emit must be legal and bounded, and the two of them must
-## not be interchangeable.
+## The baselines are explicit fieldable policies (`haggler`, `hardliner`),
+## so every order they emit must be legal and bounded, and the two of them
+## must not be interchangeable. Model seats without credentials or with
+## invalid replies fail explicitly rather than falling back to a baseline.
 
 import std/[json, monotimes, os, times, unittest]
+import bitworld/decision_trajectory
 import negotiation/[llm, sim]
 
 const Seeds = [1, 7, 42, 1234, 20260826]
@@ -87,7 +88,6 @@ suite "14. bounded orders":
         check settled == config.matches
         for seat in 0 ..< Seats:
           check sim.matchesPlayed[seat] == 4
-          check sim.fallbacks[seat] == 0
 
 suite "15. the haggler concedes monotonically":
   test "the reservation is non-increasing in the turn":
@@ -194,8 +194,9 @@ suite "16. the two baselines are not interchangeable":
     check mixed >= 100
     check hardTotal.float / mixed.float > softTotal.float / mixed.float
 
-suite "17. no credentials, no network":
-  test "decide returns the scripted action immediately":
+suite "17. no credentials, no fallback":
+  test "decide fails explicitly for model seats and runs explicit scripted seats":
+    delEnv("COWORLD_LLM_ENDPOINT")
     delEnv("ANTHROPIC_API_KEY")
     delEnv("ANTHROPIC_API_KEY_URI")
     delEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME")
@@ -207,92 +208,82 @@ suite "17. no credentials, no network":
     sim.beginMatch()
     let call = sim.currentCall()
     let started = getMonoTime()
-    let decision = client.decide(PromptSelection(), sim, call, "bargain hard", scripted = "")
+    var failed = false
+    try:
+      discard client.decide(PromptSelection(), sim, call, "bargain hard", scripted = "")
+    except PolicyFailureError as error:
+      failed = true
+      check error.status == asMissing
+      check error.attempts.len == 0
+    check failed
     let elapsed = (getMonoTime() - started).inMilliseconds
     check elapsed < 1000
-    check decision.scripted
-    ## A prompt seat that could not reach the model fell back: it counts.
-    check decision.fallback
-    let baseline = scriptedDecision(sim, "haggler")
-    check decision.action == baseline.action
-    check decision.take == baseline.take
-    ## A seat that REGISTERED a baseline is playing its policy, not degrading.
+    ## A seat that explicitly REGISTERED a baseline plays its scripted policy.
     let registered = client.decide(PromptSelection(), sim, call, "", scripted = "hardliner")
     check registered.scripted
-    check not registered.fallback
     check registered.action == scriptedDecision(sim, "hardliner").action
-    ## Past the deadline every remaining turn is scripted, instantly.
-    let forced = client.decide(PromptSelection(), sim, call, "bargain hard", scripted = "",
-      forceScripted = true)
-    check forced.scripted
-    check forced.fallback
+    check registered.take == scriptedDecision(sim, "hardliner").take
 
-  test "PLAYER_SCRIPTED values normalise":
-    check normalizeBaseline("haggler") == "haggler"
-    check normalizeBaseline("HARDLINER") == "hardliner"
-    check normalizeBaseline(" Hardliner ") == "hardliner"
-    check normalizeBaseline("1") == "haggler"
-    check normalizeBaseline("true") == "haggler"
-    check normalizeBaseline("yes") == "haggler"
-    check normalizeBaseline("") == ""
-    check normalizeBaseline("nonsense") == "haggler"
+  test "PLAYER_SCRIPTED accepts only explicit baseline names":
+    check parseBaseline("haggler") == "haggler"
+    check parseBaseline("HARDLINER") == "hardliner"
+    check parseBaseline(" Hardliner ") == "hardliner"
+    check parseBaseline("") == ""
+    for invalid in ["1", "true", "yes", "on", "nonsense"]:
+      expect NegotiationError:
+        discard parseBaseline(invalid)
 
-suite "18. reply parsing":
-  test "tolerant in exactly the documented ways":
+suite "18. strict reply parsing":
+  test "accepts only canonical action objects and rejects aliases/legacy shapes":
     var sim = initSim(fixture(0, matches = 3, maxTurns = 6))
     sim.beginMatch()
     check parseAction(sim, parseJson("""{"action":"accept"}""")).action ==
       "accept"
-    check parseAction(sim, parseJson("""{"action":"AGREE"}""")).action ==
-      "accept"
-    check parseAction(sim, parseJson("""{"action":" Deal "}""")).action ==
-      "accept"
-    check parseAction(sim, parseJson("""{"action":"Offer","take":[0,0,0]}""")
-      ).action == "offer"
-    check parseAction(sim, parseJson("""{"action":"propose","take":[0,0,0]}""")
-      ).action == "offer"
-    let object3 = parseAction(sim,
-      parseJson("""{"action":"counter","take":{"books":2,"balls":1}}"""))
-    check object3.action == "offer"
-    check object3.take == [2, 0, 1]        # a missing key defaults to 0
-    let array3 = parseAction(sim,
-      parseJson("""{"action":"offer","take":[1,2,3]}"""))
-    check array3.take == [1, 2, 3]
-    let strings = parseAction(sim,
-      parseJson("""{"take":{"books":"2","hats":"0","balls":"1"}}"""))
-    check strings.action == "offer"        # no action, but a take: an offer
-    check strings.take == [2, 0, 1]
+    let offer = parseAction(sim,
+      parseJson("""{"action":"offer","take":{"books":2,"hats":0,"balls":1}}"""))
+    check offer.action == "offer"
+    check offer.take == [2, 0, 1]
     let withText = parseAction(sim, parseJson(
       """{"action":"accept","message":"done","notes":"took it"}"""))
     check withText.message == "done"
     check withText.notes == "took it"
 
-    expect NegotiationError:                        # a fractional count
-      discard parseAction(sim,
-        parseJson("""{"action":"offer","take":{"books":1.5}}"""))
-    expect NegotiationError:                        # a non-numeric count
-      discard parseAction(sim,
-        parseJson("""{"action":"offer","take":{"books":"two"}}"""))
-    expect NegotiationError:                        # an unknown action
-      discard parseAction(sim, parseJson("""{"action":"burn"}"""))
-    expect NegotiationError:                        # no action and no take
-      discard parseAction(sim, parseJson("""{"message":"hello"}"""))
-    expect NegotiationError:                        # a malformed take
-      discard parseAction(sim,
-        parseJson("""{"action":"offer","take":[1,2]}"""))
+    for invalid in [
+      """{"action":"AGREE"}""",
+      """{"action":"deal"}""",
+      """{"action":" Deal "}""",
+      """{"action":"Offer","take":{"books":0,"hats":0,"balls":0}}""",
+      """{"action":"propose","take":{"books":0,"hats":0,"balls":0}}""",
+      """{"action":"counter","take":{"books":0,"hats":0,"balls":0}}""",
+      """{"action":"offer","take":{"books":2,"balls":1}}""",
+      """{"action":"offer","take":[1,2,3]}""",
+      """{"take":{"books":2,"hats":0,"balls":1}}""",
+      """{"action":"offer","take":{"books":"2","hats":"0","balls":"1"}}""",
+      """{"action":"offer","take":{"books":1.5,"hats":0,"balls":0}}""",
+      """{"action":"offer","take":{"books":"two","hats":0,"balls":0}}""",
+      """{"action":"offer","take":{"books":0,"hats":0,"balls":0,"extra":1}}""",
+      """{"action":"accept","take":{"books":0,"hats":0,"balls":0}}""",
+      """{"action":"burn"}""",
+      """{"message":"hello"}""",
+      """{"action":"accept","message":123}""",
+      """[1,2,3]"""
+    ]:
+      expect NegotiationError:
+        discard parseAction(sim, parseJson(invalid))
 
-  test "JSON is extracted from fences and trailing prose":
-    let fenced = extractJsonObject(
-      "```json\n{\"action\":\"accept\",\"message\":\"ok\"}\n```\n" &
-      "That is my move.")
-    check fenced["action"].getStr() == "accept"
-    let leading = extractJsonObject(
-      "Here is my offer: {\"action\":\"offer\",\"take\":[1,0,0]}")
-    check leading["take"].len == 3
-    expect NegotiationError:
-      discard extractJsonObject("I accept your generous offer.")
-    expect NegotiationError:
-      discard extractJsonObject("")
+  test "parseJsonObject requires a single JSON object with no fences or prose":
+    let clean = parseJsonObject("""  {"action":"accept","message":"ok"}  """)
+    check clean["action"].getStr() == "accept"
+    for invalid in [
+      "```json\n{\"action\":\"accept\",\"message\":\"ok\"}\n```",
+      "Here is my offer: {\"action\":\"offer\",\"take\":{\"books\":1,\"hats\":0,\"balls\":0}}",
+      "{\"action\":\"accept\"} trailing prose",
+      "I accept your generous offer.",
+      "[1, 2, 3]",
+      ""
+    ]:
+      expect NegotiationError:
+        discard parseJsonObject(invalid)
 
   test "out-of-range takes and accept on turn 1 are rejected on the probe":
     ## `decide` applies every parsed decision to a probe copy of the sim

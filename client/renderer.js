@@ -12,7 +12,7 @@
 // chrome provides is reached through `C.`.
 //
 // The state object it draws (one frame, from the Nim sim):
-//   {seats:[{name,score,points,matches,deals,giveaway,fallbacks,role,notes} x3],
+//   {seats:[{name,score,points,matches,deals,giveaway,role,notes} x3],
 //    match, matches, matchesPlayed, kind, itemNames:["books","hats","balls"],
 //    table: null | {a,b,opener,pool[3],values[2][3],turn,maxTurns,actor,
 //                   standing:null|{side,take[3],worth[2]},

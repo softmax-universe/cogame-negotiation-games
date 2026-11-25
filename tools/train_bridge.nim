@@ -83,7 +83,7 @@ when isMainModule:
     of "step":
       doAssert not game.done and request["decision_id"].getInt() == id
       let call = game.currentCall()
-      let parsed = parseAction(game, extractJsonObject(request["response"].getStr()))
+      let parsed = parseAction(game, parseJsonObject(request["response"].getStr()))
       if parsed.action == "accept":
         game.applyAccept(call.match, parsed.message, parsed.notes, false)
       else:

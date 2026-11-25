@@ -9,7 +9,7 @@ var captures: seq[JsonNode]
 for line in readFile(args[1]).strip().splitLines(): captures.add(parseJson(line))
 let summary = captures[^1]
 let traceGame = summary["game"].getStr()
-doAssert traceGame in ["negotiation", "negotiation-games"]
+doAssert traceGame == "negotiation-games"
 doAssert summary["event_type"].getStr() == "episode"
 doAssert summary["episode_id"].getStr() == args[2]
 doAssert summary["outcome"] == replay["results"]
@@ -50,11 +50,11 @@ for eventIndex, event in events:
     let configuration = capture["observation"]["prompt_configuration"]
     if index == 0: episodeSelection = configuration
     doAssert configuration == episodeSelection
-    let selection = if configuration.hasKey("bank"):
-      promptSelection(%*{"promptVariant": configuration["selection"], "promptSeed": configuration["seed"]})
-      else: promptSelection(configuration)
-    if traceGame == "negotiation-games":
-      doAssert configuration == selection.selectionMetadata()
+    doAssert configuration.hasKey("bank")
+    let selection = promptSelection(
+      %*{"promptVariant": configuration["selection"], "promptSeed": configuration["seed"]}
+    )
+    doAssert configuration == selection.selectionMetadata()
     let system = systemPrompt(selection, frames[eventIndex], seat)
     let user = userPrompt(frames[eventIndex], seat, operatorPrompt)
     var modelAttempt = 0
@@ -68,7 +68,7 @@ for eventIndex, event in events:
         doAssert attempt["request"]["system"].getStr() == system
         doAssert attempt["request"]["messages"][0]["content"] == attempt["prompt"][1]["content"]
       if attempt["attempt_id"] == capture["selected_attempt_id"] and attempt["origin"].getStr() in ["model", "teacher"]:
-        let parsed = parseAction(frames[eventIndex], extractJsonObject(attempt["response"].getStr()))
+        let parsed = parseAction(frames[eventIndex], parseJsonObject(attempt["response"].getStr()))
         var normalized = %*{"action": parsed.action, "message": parsed.message, "notes": parsed.notes}
         if parsed.action == "offer":
           var take = newJObject()

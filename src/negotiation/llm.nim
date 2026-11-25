@@ -9,11 +9,10 @@
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing. The same
-## scripted bots are also fieldable policies: a player that registers as
-## `haggler` or `hardliner` plays one deliberately, LLM or not.
+## Scripted bots are explicit fieldable policies: a player that registers as
+## `haggler` or `hardliner` plays one deliberately, LLM or not. Model seats
+## never fall back to a scripted baseline: missing credentials, transport
+## failures, timeouts, or invalid/illegal replies fail the episode explicitly.
 
 import
   std/[json, math, options, os, random, strutils],
@@ -26,24 +25,24 @@ const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
   BedrockAnthropicVersion = "bedrock-2023-05-31"
-  ## The baseline a seat falls back to when it registered a prompt (or
-  ## nothing at all) and the model path fails.
-  DefaultBaseline* = "haggler"
   Baselines* = ["haggler", "hardliner"]
   RetryHint* = "\nYour previous reply was invalid. Respond with ONLY the " &
     "requested JSON object: either {\"action\":\"accept\",...} or " &
-    "{\"action\":\"offer\",\"take\":{...}} with every count inside the " &
-    "bounds shown."
+    "{\"action\":\"offer\",\"take\":{\"books\":...,\"hats\":...,\"balls\":...},...} " &
+    "with every count inside the bounds shown."
 
 type
+  PolicyFailureError* = object of NegotiationError
+    attempts*: seq[DecisionAttempt]
+    status*: ActionStatus
+
   Decision* = object
     nativeAttempts*: seq[DecisionAttempt]
     action*: string              ## "offer" | "accept"
     take*: array[Items, int]     ## offer: how many of each item the actor takes
     message*: string             ## cheap talk, <= MaxMessageLen runes
     notes*: string               ## private, <= MaxNotesLen runes
-    scripted*: bool              ## produced by a scripted baseline
-    fallback*: bool              ## the model path was skipped or gave up
+    scripted*: bool              ## produced by an explicit scripted policy
 
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -63,18 +62,15 @@ type
     disabled*: bool   ## true once credentials are known-unavailable
     rand: Rand
 
-proc normalizeBaseline*(name: string): string =
-  ## `1|true|yes` mean the default baseline, for compatibility with the
-  ## lineage's boolean PLAYER_SCRIPTED.
+proc parseBaseline*(name: string): string =
   let text = name.strip().toLowerAscii()
   if text.len == 0:
     return ""
-  if text in ["1", "true", "yes", "on"]:
-    return DefaultBaseline
   for baseline in Baselines:
     if text == baseline:
       return baseline
-  DefaultBaseline
+  raise newException(NegotiationError,
+    "unknown scripted baseline: " & name & " (expected haggler or hardliner)")
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -155,7 +151,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "negotiation llm: no LLM credentials; using scripted fallback"
+    echo "negotiation llm: no LLM credentials configured"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -398,76 +394,63 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
 
 # ---- Reply parsing ----------------------------------------------------------
 
-proc countFrom(node: JsonNode): int =
-  ## A count is a JSON integer or an integer-valued string. Anything else —
-  ## a float, a fraction, a word — is an invalid reply.
-  if node.isNil or node.kind == JNull:
-    return 0
-  case node.kind
-  of JInt:
-    node.getInt()
-  of JString:
-    try:
-      parseInt(node.getStr().strip())
-    except ValueError:
-      raise newException(NegotiationError,
-        "counts must be whole numbers: " & node.getStr())
-  else:
-    raise newException(NegotiationError, "counts must be whole numbers: " & $node)
+proc optionalStringField(payload: JsonNode, key: string): string =
+  if not payload.hasKey(key) or payload[key].kind == JNull:
+    return ""
+  if payload[key].kind != JString:
+    raise newException(NegotiationError, key & " must be a string")
+  payload[key].getStr()
 
 proc parseAction*(sim: Sim, payload: JsonNode): Decision =
-  ## Tolerant in exactly these ways and no others:
-  ##  - `action` case-insensitive after trimming; accept|agree|deal and
-  ##    offer|propose|counter are synonyms;
-  ##  - `action` absent but `take` present means an offer;
-  ##  - `take` may be {books,hats,balls} (missing keys are 0) or the
-  ##    3-element array [books, hats, balls], with JSON integers or
-  ##    integer-valued strings.
-  ## Everything else is an invalid reply. Legality (bounds, accept on turn
-  ## one) is enforced by applying the decision to a probe copy in `decide`.
-  result.message = cleanMessage(payload{"message"}.getStr())
-  result.notes = cleanNotes(payload{"notes"}.getStr())
-  let takeNode = payload{"take"}
-  let hasTake = not takeNode.isNil and takeNode.kind != JNull
-  let action = payload{"action"}.getStr().strip().toLowerAscii()
-  if action in ["accept", "agree", "deal"]:
+  ## Strict canonical action parser:
+  ##   {"action":"accept","message":"...","notes":"..."}
+  ##   {"action":"offer","take":{"books":int,"hats":int,"balls":int},"message":"...","notes":"..."}
+  ## `message` and `notes` are optional strings. Everything else is invalid.
+  ## Legality (bounds, accept on turn 1) is enforced by applying the decision
+  ## to a probe copy in `decide` and in the server.
+  if payload.isNil or payload.kind != JObject:
+    raise newException(NegotiationError, "action payload must be a JSON object")
+  if not payload.hasKey("action") or payload["action"].kind != JString:
+    raise newException(NegotiationError, "action must be a string (\"offer\" or \"accept\")")
+  result.message = cleanMessage(optionalStringField(payload, "message"))
+  result.notes = cleanNotes(optionalStringField(payload, "notes"))
+  let action = payload["action"].getStr()
+  case action
+  of "accept":
+    if payload.hasKey("take") and payload["take"].kind != JNull:
+      raise newException(NegotiationError, "accept must not include take")
     result.action = "accept"
     return
-  if action notin ["offer", "propose", "counter"]:
-    if action.len > 0 or not hasTake:
+  of "offer":
+    result.action = "offer"
+    if not payload.hasKey("take") or payload["take"].kind != JObject:
       raise newException(NegotiationError,
-        "unknown action: " & payload{"action"}.getStr())
-  result.action = "offer"
-  if not hasTake:
-    raise newException(NegotiationError, "an offer needs a take")
-  case takeNode.kind
-  of JObject:
-    for index in 0 ..< Items:
-      result.take[index] = countFrom(takeNode{ItemNames[index]})
-  of JArray:
+        "offer requires take as an object with integer counts for books, hats, balls")
+    let takeNode = payload["take"]
     if takeNode.len != Items:
       raise newException(NegotiationError,
-        "take as an array must hold exactly " & $Items & " counts")
+        "take must contain exactly books, hats, and balls")
     for index in 0 ..< Items:
-      result.take[index] = countFrom(takeNode[index])
+      let key = ItemNames[index]
+      if not takeNode.hasKey(key) or takeNode[key].kind != JInt:
+        raise newException(NegotiationError,
+          "take." & key & " must be an integer")
+      result.take[index] = takeNode[key].getInt()
   else:
-    raise newException(NegotiationError,
-      "take must be an object or a 3-element array")
+    raise newException(NegotiationError, "unknown action: " & action)
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
-proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model sent
-    ## instead of JSON (prose, a refusal, a cut-off analysis...). Cut on a
-    ## rune boundary: this string can reach a log line and a replay.
-    let head = capRunes(text.strip().replace("\n", " "), 160)
-    raise newException(NegotiationError, "no JSON object in response: " & head)
-  parseJson(text[start .. stop])
+proc parseJsonObject*(text: string): JsonNode =
+  ## Parses a single JSON object reply with no surrounding prose or fences.
+  let trimmed = text.strip()
+  if trimmed.len == 0 or trimmed[0] != '{' or trimmed[^1] != '}':
+    let head = capRunes(trimmed.replace("\n", " "), 160)
+    raise newException(NegotiationError, "reply must be a single JSON object: " & head)
+  let node = parseJson(trimmed)
+  if node.kind != JObject:
+    raise newException(NegotiationError, "reply must be a JSON object")
+  node
 
 proc completeText(client: LlmClient, system, user: string, slot: int, evidence: var DecisionAttempt): string =
   var body = %*{
@@ -531,28 +514,34 @@ proc completeText(client: LlmClient, system, user: string, slot: int, evidence: 
     raise newException(NegotiationError, "reply cut off at max_tokens before " &
       "any JSON: " & capRunes(result.replace("\n", " "), 160))
 
+proc newPolicyFailure(msg: string, attempts: seq[DecisionAttempt],
+    status: ActionStatus): ref PolicyFailureError =
+  result = newException(PolicyFailureError, msg)
+  result.attempts = attempts
+  result.status = status
+
 proc decide*(
   client: LlmClient,
   selection: PromptSelection,
   sim: Sim,
   call: Call,
   prompt: string,
-  scripted: string,
-  forceScripted = false
+  scripted: string
 ): Decision =
-  ## One decision for one seat. Never raises: any failure falls back to the
-  ## seat's scripted baseline so the turn always advances.
-  let baseline =
-    if scripted.len > 0: normalizeBaseline(scripted) else: DefaultBaseline
+  ## One decision for one seat. Explicit scripted seats run their chosen
+  ## baseline; model seats either return a valid legal model decision or
+  ## raise PolicyFailureError with all failed attempts preserved.
   if scripted.len > 0:
-    ## A registered scripted seat is playing its policy, not degrading.
-    return scriptedDecision(sim, baseline)
-  if forceScripted or client.disabled:
-    result = scriptedDecision(sim, baseline)
-    result.fallback = true
-    return
+    return scriptedDecision(sim, parseBaseline(scripted))
+  if client.disabled:
+    raise newPolicyFailure(
+      "LLM transport unavailable or unauthenticated for model seat",
+      @[],
+      asMissing
+    )
   let system = systemPrompt(selection, sim, call.seat)
   var retained: seq[DecisionAttempt]
+  var lastError = "model failed to produce a valid action"
   for attempt in 0 .. 1:
     var evidence = newDecisionAttempt("attempt-" & $attempt, client.model, aoModel)
     var raw = ""
@@ -562,7 +551,7 @@ proc decide*(
       if attempt > 0:
         user.add(RetryHint)
       raw = client.completeText(system, user, call.seat, evidence)
-      let payload = extractJsonObject(raw)
+      let payload = parseJsonObject(raw)
       decision = parseAction(sim, payload)
       ## Reject illegal replies here so the retry carries the hint.
       var probe = sim
@@ -576,6 +565,7 @@ proc decide*(
       decision.nativeAttempts = retained & @[evidence]
       return decision
     except CatchableError as error:
+      lastError = error.msg
       evidence.response = %raw
       evidence.rejectionReason = some(error.msg)
       retained.add(evidence)
@@ -583,11 +573,11 @@ proc decide*(
         " failed: ", error.msg
       if client.disabled:
         break
-  echo "negotiation llm: seat ", call.seat,
-    " falling back to the ", baseline, " baseline"
-  result = scriptedDecision(sim, baseline)
-  result.fallback = true
-  result.nativeAttempts = retained
+  raise newPolicyFailure(
+    "seat " & $call.seat & " model decision failed: " & lastError,
+    retained,
+    asRejected
+  )
 
 
 proc decisionJson*(decision: Decision): JsonNode =

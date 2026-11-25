@@ -104,7 +104,7 @@ def main() -> int:
           f"{results.get('reason')!r}")
     check(len(results.get("scores") or []) == SEATS,
           f"results.scores must hold {SEATS} entries")
-    for name in ("points", "matches", "deals", "giveaway", "fallbacks"):
+    for name in ("points", "matches", "deals", "giveaway"):
         check(len(results.get(name) or []) == SEATS,
               f"results.{name} must hold {SEATS} entries")
 

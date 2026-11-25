@@ -13,14 +13,17 @@
 ##   WS  /global                     - spectator snapshots
 ##   WS  /replay                     - replay payload (replay mode)
 ##
-## Player protocol (negotiation.player.v1), all JSON text frames:
-##   game -> player: {"type":"welcome","slot":N,"name":...,"matches":M,"maxTurns":T}
+## Player protocol (negotiation.player.v2), all JSON text frames:
+##   game -> player: {"type":"welcome","protocol":"negotiation.player.v2","slot":N,"name":...,"matches":M,"maxTurns":T}
 ##                   {"type":"state",...} after every event, REDACTED to the
-##                   seat's own tallies (the game is hidden-information and
-##                   every decision is server-side)
+##                   seat's own tallies
+##                   {"type":"observation","event":E,"observation":...,"prompt_configuration":...,"input":{"system":...,"user":...}}
+##                   (external policies only, on their turn)
 ##                   {"type":"final","scores":[...],...}
-##   player -> game: {"type":"prompt","prompt":"...","scripted":"haggler"}
-##                   (prompt max 4000 chars; scripted names a baseline)
+##                   {"type":"failed","failedSeat":N,"reason":...,"slot":N}
+##   player -> game: {"type":"prompt","prompt":"...","scripted":""|"haggler"|"hardliner"}
+##                   {"type":"register","control":"external"}
+##                   {"type":"action","event":E,"action":{...}}
 
 import
   std/[json, locks, options, os, sets, strutils, tables, times, unicode],
@@ -42,13 +45,18 @@ type
     config: GameConfig
     sim: Sim
     prompts: seq[string]
-    scripted: seq[string]      ## "" = LLM seat; else the baseline's name
+    scripted: seq[string]      ## "" = LLM seat; else "haggler" | "hardliner"
     external: seq[bool]
     registered: seq[bool]
+    registrationError: seq[string]
     awaitingSeat: int
     awaitingEvent: int
     pendingAction: Decision
     hasPendingAction: bool
+    pendingFailure: string
+    hasPendingFailure: bool
+    pendingFailureAttempts: seq[DecisionAttempt]
+    pendingFailureStatus: ActionStatus
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -240,6 +248,84 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "negotiation: episode complete, shutting down"
   quit(0)
 
+proc failEpisode(
+  runtimeConfig: RuntimeConfig,
+  failedSeat: int,
+  reason: string,
+  simBefore: Sim,
+  seatPrompt: string,
+  seatExternal: bool,
+  selection: PromptSelection,
+  attempts: seq[DecisionAttempt],
+  status: ActionStatus
+) =
+  let message = capRunes(reason, 2000)
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    var failed = %*{
+      "type": "failed",
+      "done": true,
+      "failedSeat": failedSeat,
+      "reason": message
+    }
+    for slot, socket in state.playerSockets:
+      failed["slot"] = %slot
+      try:
+        socket.send($failed)
+      except CatchableError:
+        discard
+
+  echo "negotiation: episode failed on seat ", failedSeat, ": ", message
+
+  if state.trajectory.isSome:
+    var retained = attempts
+    let policyName =
+      if failedSeat >= 0 and failedSeat < state.config.players.len:
+        state.config.players[failedSeat].name
+      else:
+        "unknown"
+    for attempt in retained.mitems:
+      attempt.policy = policyName
+      attempt.accepted = false
+    if simBefore.match >= 0 and failedSeat >= 0 and failedSeat < Seats:
+      state.trajectory.get().recordDecision(
+        $simBefore.events.len,
+        $failedSeat,
+        %*{
+          "view": decisionObservation(simBefore, failedSeat),
+          "operator_prompt": seatPrompt,
+          "control": (if seatExternal: "external" else: "internal"),
+          "prompt_configuration": selection.selectionMetadata()
+        },
+        retained,
+        none(string),
+        newJNull(),
+        status,
+        terminal = true
+      )
+    state.trajectory.get().finish(
+      esFailed,
+      %*{"status": "failed", "failed_seat": failedSeat, "reason": message},
+      newJNull()
+    )
+    state.trajectory.get().writeEventsToUri(getEnv("COGAME_SAVE_TRAJECTORY_URI"))
+
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    let payload = $ %*{
+      "message": (if message.len > 0: message else: "policy failure"),
+      "failed_policy_index": failedSeat
+    }
+    writeArtifact(
+      failureUri, payload, "application/json",
+      "COGAME_PLAYER_FAILURE_METHOD"
+    )
+
+  sleep(200)
+  quit(1)
+
 const PlayBudgetFraction* = 0.6
   ## Share of the platform's episode timeout spent playing. The rest covers
   ## container start, player connects, and writing the artifacts — the part
@@ -285,6 +371,16 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       echo "negotiation: starting with ", state.playerSockets.len, "/",
         config.tokens.len, " players connected"
       state.broadcastLocked()
+
+    for slot in 0 ..< config.tokens.len:
+      var regErr = ""
+      var simSnap: Sim
+      withLock stateLock:
+        regErr = state.registrationError[slot]
+        simSnap = state.sim
+      if regErr.len > 0:
+        failEpisode(runtimeConfig, slot, "invalid player registration: " & regErr,
+          simSnap, "", false, selection, @[], asRejected)
 
     let client = newLlmClient(config)
 
@@ -347,22 +443,30 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         simCopy = state.sim
         seatPrompt = state.prompts[call.seat]
         seatScripted = state.scripted[call.seat]
-        seatExternal = state.external[call.seat] and not pastDeadline and
-          state.playerSockets.hasKey(call.seat)
+        seatExternal = state.external[call.seat]
         if seatExternal:
-          state.awaitingSeat = call.seat
-          state.awaitingEvent = state.sim.events.len
-          state.hasPendingAction = false
-          state.playerSockets[call.seat].send($ %*{
-            "type": "observation", "event": state.awaitingEvent,
-            "prompt_configuration": selection.selectionMetadata(),
-            "input": {"system": systemPrompt(selection, state.sim, call.seat),
-              "user": userPrompt(state.sim, call.seat, seatPrompt)},
-            "observation": state.sim.decisionObservation(call.seat)})
+          if not state.playerSockets.hasKey(call.seat):
+            state.pendingFailure = "external player disconnected before turn"
+            state.pendingFailureAttempts = @[]
+            state.pendingFailureStatus = asMissing
+            state.hasPendingFailure = true
+            state.hasPendingAction = false
+          else:
+            state.awaitingSeat = call.seat
+            state.awaitingEvent = state.sim.events.len
+            state.hasPendingAction = false
+            state.hasPendingFailure = false
+            state.pendingFailure = ""
+            state.pendingFailureAttempts = @[]
+            state.playerSockets[call.seat].send($ %*{
+              "type": "observation", "event": state.awaitingEvent,
+              "prompt_configuration": selection.selectionMetadata(),
+              "input": {"system": systemPrompt(selection, state.sim, call.seat),
+                "user": userPrompt(state.sim, call.seat, seatPrompt)},
+              "observation": state.sim.decisionObservation(call.seat)})
 
-      let useScripted = not seatExternal and
-        (seatScripted.len > 0 or pastDeadline or client.disabled)
-      if not useScripted:
+      let useScripted = not seatExternal and seatScripted.len > 0
+      if not useScripted and not seatExternal:
         ## Wall-clock floor between model calls: the hosted Bedrock sidecar
         ## caps 30 requests/minute per episode.
         let waitMs = MinCallSpacingMs -
@@ -371,39 +475,59 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           sleep(waitMs)
         lastCallStart = epochTime()
 
-      ## The slow part (Claude) runs outside the lock on a snapshot; only
-      ## this thread mutates the sim, so the snapshot cannot go stale.
+      ## The slow part (Claude or external policy) runs outside the lock on a
+      ## snapshot; only this thread mutates the sim, so the snapshot cannot go
+      ## stale.
       var decision: Decision
       if seatExternal:
         let actionDeadline = epochTime() + config.llmTimeoutSeconds.float
         while epochTime() < actionDeadline:
           var ready = false
           withLock stateLock:
-            ready = state.hasPendingAction
+            ready = state.hasPendingAction or state.hasPendingFailure
           if ready:
             break
           sleep(20)
+        var extFailed = false
+        var extReason = ""
+        var extAttempts: seq[DecisionAttempt]
+        var extStatus = asMissing
         withLock stateLock:
           state.awaitingSeat = -1
           if state.hasPendingAction:
             decision = state.pendingAction
+          elif state.hasPendingFailure:
+            extFailed = true
+            extReason = state.pendingFailure
+            extAttempts = state.pendingFailureAttempts
+            extStatus = state.pendingFailureStatus
           else:
-            decision = scriptedDecision(simCopy, DefaultBaseline)
-            decision.fallback = true
+            extFailed = true
+            extReason = "external player timed out waiting for action"
+            extStatus = asMissing
+        if extFailed:
+          failEpisode(runtimeConfig, call.seat, extReason, simCopy, seatPrompt,
+            true, selection, extAttempts, extStatus)
       else:
-        decision = client.decide(selection, simCopy, call, seatPrompt,
-          scripted = seatScripted, forceScripted = pastDeadline)
+        try:
+          decision = client.decide(selection, simCopy, call, seatPrompt,
+            scripted = seatScripted)
+        except PolicyFailureError as error:
+          failEpisode(runtimeConfig, call.seat, error.msg, simCopy, seatPrompt,
+            false, selection, error.attempts, error.status)
+        except CatchableError as error:
+          failEpisode(runtimeConfig, call.seat, error.msg, simCopy, seatPrompt,
+            false, selection, @[], asRejected)
 
       var settledBefore = 0
       var settledAfter = 0
+      var applyError = ""
       withLock stateLock:
         settledBefore = state.sim.matchesSettled
         echo "negotiation: match ", state.sim.match + 1, " turn ",
           state.sim.turn, " ", decisionText(state.sim, decision),
           (if decision.scripted: " [scripted]" else: ""), " at ",
           (epochTime() - gameStart).int, "s"
-        var executed = decision
-        var engineRejected = false
         try:
           if decision.action == "accept":
             state.sim.applyAccept(call.match, decision.message,
@@ -412,41 +536,32 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             state.sim.applyOffer(call.match, decision.take, decision.message,
               decision.notes, decision.scripted)
         except NegotiationError as error:
-          echo "negotiation: reply rejected (", error.msg,
-            "); using the scripted fallback"
-          let fallback = scriptedDecision(state.sim, DefaultBaseline)
-          executed = fallback
-          executed.message = ""
-          executed.notes = ""
-          engineRejected = true
-          state.sim.recordFallback(call.seat)
-          if fallback.action == "accept":
-            state.sim.applyAccept(call.match, "", "", true)
-          else:
-            state.sim.applyOffer(call.match, fallback.take, "", "", true)
-        if decision.fallback:
-          state.sim.recordFallback(call.seat)
-        if state.trajectory.isSome:
-          var action = %*{"action": executed.action, "message": executed.message,
-            "notes": executed.notes}
-          if executed.action == "offer":
-            var take = newJObject()
-            for index in 0 ..< Items:
-              take[ItemNames[index]] = %executed.take[index]
-            action["take"] = take
-          let origin =
-            if engineRejected or executed.fallback: aoFallback
-            elif executed.nativeAttempts.len > 0: aoModel
-            elif seatExternal: aoUnknown
-            else: aoTeacher
-          state.trajectory.get().recordExecutedDecision($simCopy.events.len, $call.seat,
-            config.players[call.seat].name, %*{"view": decisionObservation(simCopy, call.seat), "operator_prompt": seatPrompt,
-              "control": (if seatExternal: "external" else: "internal"),
-              "prompt_configuration": selection.selectionMetadata()},
-            action, decision.nativeAttempts, origin, systemPrompt(selection, simCopy, call.seat),
-            userPrompt(simCopy, call.seat, seatPrompt), state.sim.done)
-        settledAfter = state.sim.matchesSettled
-        state.broadcastLocked()
+          applyError = error.msg
+        if applyError.len == 0:
+          if state.trajectory.isSome:
+            var action = %*{"action": decision.action, "message": decision.message,
+              "notes": decision.notes}
+            if decision.action == "offer":
+              var take = newJObject()
+              for index in 0 ..< Items:
+                take[ItemNames[index]] = %decision.take[index]
+              action["take"] = take
+            let origin =
+              if decision.nativeAttempts.len > 0: aoModel
+              elif seatExternal: aoUnknown
+              else: aoTeacher
+            state.trajectory.get().recordExecutedDecision($simCopy.events.len, $call.seat,
+              config.players[call.seat].name, %*{"view": decisionObservation(simCopy, call.seat), "operator_prompt": seatPrompt,
+                "control": (if seatExternal: "external" else: "internal"),
+                "prompt_configuration": selection.selectionMetadata()},
+              action, decision.nativeAttempts, origin, systemPrompt(selection, simCopy, call.seat),
+              userPrompt(simCopy, call.seat, seatPrompt), state.sim.done)
+          settledAfter = state.sim.matchesSettled
+          state.broadcastLocked()
+      if applyError.len > 0:
+        failEpisode(runtimeConfig, call.seat, "illegal action: " & applyError,
+          simCopy, seatPrompt, seatExternal, selection, decision.nativeAttempts,
+          asRejected)
 
       ## Pace between matches for the spectator, inside a whole-episode
       ## budget so pacing can never be the thing that runs out of time.
@@ -570,54 +685,87 @@ proc websocketHandler(
         return
       try:
         let payload = parseJson(message.data)
-        if payload{"type"}.getStr() == "register":
-          if payload["control"].getStr() != "external":
+        if payload.kind != JObject:
+          raise newException(NegotiationError, "player frame must be a JSON object")
+        let frameType = payload{"type"}.getStr()
+        if frameType == "register":
+          if payload{"control"}.getStr() != "external":
             raise newException(NegotiationError, "unknown player control")
           withLock stateLock:
             state.external[slot] = true
             state.registered[slot] = true
+            state.registrationError[slot] = ""
           return
-        if payload{"type"}.getStr() == "action":
+        if frameType == "action":
           withLock stateLock:
             if state.external[slot] and state.awaitingSeat == slot and
+                payload.hasKey("event") and payload["event"].kind == JInt and
                 state.awaitingEvent == payload["event"].getInt():
-              var decision = parseAction(state.sim, payload["action"])
-              if payload.hasKey("attempts"):
+              var attempts: seq[DecisionAttempt]
+              if payload.hasKey("attempts") and payload["attempts"].kind == JArray:
                 for attempt in payload["attempts"]:
-                  decision.nativeAttempts.add(readAttemptEvidence(attempt))
-              var probe = state.sim
-              if decision.action == "accept":
-                probe.applyAccept(state.sim.match, decision.message,
-                  decision.notes, false)
-              else:
-                probe.applyOffer(state.sim.match, decision.take,
-                  decision.message, decision.notes, false)
-              state.pendingAction = decision
-              state.hasPendingAction = true
+                  try:
+                    attempts.add(readAttemptEvidence(attempt))
+                  except CatchableError:
+                    discard
+              try:
+                if not payload.hasKey("action"):
+                  raise newException(NegotiationError, "action frame missing action field")
+                var decision = parseAction(state.sim, payload["action"])
+                decision.nativeAttempts = attempts
+                var probe = state.sim
+                if decision.action == "accept":
+                  probe.applyAccept(state.sim.match, decision.message,
+                    decision.notes, false)
+                else:
+                  probe.applyOffer(state.sim.match, decision.take,
+                    decision.message, decision.notes, false)
+                state.pendingAction = decision
+                state.hasPendingAction = true
+              except CatchableError as error:
+                if attempts.len == 0:
+                  var rawAttempt = newDecisionAttempt(
+                    "external-action",
+                    state.config.players[slot].name,
+                    aoUnknown
+                  )
+                  rawAttempt.response = %message.data
+                  rawAttempt.rejectionReason = some(error.msg)
+                  attempts.add(rawAttempt)
+                else:
+                  attempts[^1].rejectionReason = some(error.msg)
+                state.pendingFailure = "external action rejected: " & error.msg
+                state.pendingFailureAttempts = attempts
+                state.pendingFailureStatus = asRejected
+                state.hasPendingFailure = true
           return
-        if payload{"type"}.getStr() == "prompt":
+        if frameType == "prompt":
           ## Cut in RUNES (sim.cleanPrompt), like every other string this
           ## game keeps: the prompt is interpolated verbatim into the model
           ## request body, and a byte slice can cut a rune in half.
           let prompt = cleanPrompt(payload{"prompt"}.getStr())
           let scriptedNode = payload{"scripted"}
           var baseline = ""
-          if not scriptedNode.isNil:
-            case scriptedNode.kind
-            of JString: baseline = normalizeBaseline(scriptedNode.getStr())
-            of JBool:
-              baseline = (if scriptedNode.getBool(): DefaultBaseline else: "")
-            else: discard
+          if not scriptedNode.isNil and scriptedNode.kind != JNull:
+            if scriptedNode.kind != JString:
+              raise newException(NegotiationError,
+                "scripted must be a string (\"\", \"haggler\", or \"hardliner\")")
+            baseline = parseBaseline(scriptedNode.getStr())
           withLock stateLock:
             state.prompts[slot] = prompt
             state.scripted[slot] = baseline
             state.external[slot] = false
             state.registered[slot] = true
+            state.registrationError[slot] = ""
           echo "negotiation: slot ", slot, " delivered a prompt (",
             prompt.runeLen, " runes",
             (if baseline.len > 0: ", scripted " & baseline else: ""), ")"
       except CatchableError as error:
-        echo "negotiation: ignoring bad player frame: ", error.msg
+        echo "negotiation: bad player frame from slot ", slot, ": ", error.msg
+        withLock stateLock:
+          if not state.started and slot >= 0 and slot < state.registrationError.len:
+            state.registrationError[slot] = error.msg
+            state.registered[slot] = true
     of ErrorEvent:
       discard
     of CloseEvent:
@@ -627,6 +775,12 @@ proc websocketHandler(
           state.socketSlots.del(websocket)
           if state.playerSockets.getOrDefault(slot) == websocket:
             state.playerSockets.del(slot)
+          if state.awaitingSeat == slot and not state.hasPendingAction and
+              not state.hasPendingFailure:
+            state.pendingFailure = "external player disconnected"
+            state.pendingFailureAttempts = @[]
+            state.pendingFailureStatus = asMissing
+            state.hasPendingFailure = true
         state.globalSockets.excl(websocket)
 
 proc buildRouter(replayMode: bool): Router =
@@ -693,6 +847,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.scripted = newSeq[string](config.players.len)
   state.external = newSeq[bool](config.players.len)
   state.registered = newSeq[bool](config.players.len)
+  state.registrationError = newSeq[string](config.players.len)
   state.awaitingSeat = -1
   runtimeConfigGlobal = runtimeConfig
 
