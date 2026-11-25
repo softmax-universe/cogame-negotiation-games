@@ -38,22 +38,24 @@ PLAYER_PROTOCOL = (
     "names and other seats' private information are excluded. Final frames carry scores, "
     'points, deals, anonymous names, matchesPlayed, reason, and slot; failed frames carry '
     'failedSeat, reason, and slot; players then exit. '
-    'Prompt policies send {"type":"prompt","prompt":str,"scripted":str}; the game makes '
-    'model calls using the latest operator guidance when scripted is empty. PLAYER_PROMPT '
-    'supplies guidance, and PLAYER_SCRIPTED explicitly selects haggler or hardliner. Prompts '
-    'are capped at 4000 characters. '
-    'External policies register {"type":"register","control":"external"}. Their turns receive'
-    ' {"type":"observation","event":int,"observation":object,"prompt_configuration":{bank,var'
-    'iant,selection,seed},"input":{"system":str,"user":str}}. The observation includes only '
-    "the acting seat's valuation, public offers, own notes, and prior results. Reply with "
-    '{"type":"action","event":int,"action":object}, preserving the event ID. The action is '
-    'either '
+    'The canonical model player (/bin/negotiation-player with COWORLD_LLM_ENABLED=true and '
+    'COWORLD_LLM_MODEL) registers {"type":"register","control":"external","prompt":str} '
+    'using PLAYER_PROMPT (capped at 4000 characters), calls COWORLD_LLM_ENDPOINT on each '
+    'observation turn, and replies with {"type":"action","event":int,"action":object,'
+    '"attempts":[...]} or {"type":"action_failed","event":int,"reason":str,"status":str,'
+    '"attempts":[...]}. Explicit scripted baselines send '
+    '{"type":"prompt","prompt":str,"scripted":"haggler"|"hardliner"} via PLAYER_SCRIPTED. '
+    'External policies receive {"type":"observation","event":int,"observation":object,'
+    '"prompt_configuration":{bank,variant,selection,seed},"input":{"system":str,"user":str}}. '
+    "The observation includes only the acting seat's valuation, public offers, own notes, "
+    'and prior results. The action is either '
     '{"action":"offer","take":{"books":int,"hats":int,"balls":int},"message":str,"notes":str}'
-    ' or {"action":"accept","message":str,"notes":str}. Counts must fit the pool, and '
+    ' or {"action":"accept","message":str,"notes":str}, optionally wrapped in a single '
+    'Markdown code fence with no surrounding prose. Counts must fit the pool, and '
     'accepting requires a standing opponent offer. Game-owned prompt selection stays fixed '
     'for the episode; operator guidance remains separate. The game owns legality, failure '
     'handling, scoring, and replay; missing credentials, timeouts, or invalid/illegal replies '
-    'fail the episode explicitly without substituting a move or publishing scores.'
+    'fail the episode explicitly without retries, fallback moves, or published scores.'
 )
 
 GLOBAL_PROTOCOL = (
@@ -94,9 +96,10 @@ README = (
     "accept the offer standing against it. A deal pays each side the value "
     "TO IT of what it ended up holding, out of 10; the turn cliff pays both "
     "sides zero. Six matches per episode, so every pairing plays twice and "
-    "every seat opens twice. A policy is just a prompt: field one by "
-    "reusing the published /bin/negotiation-player binary with PLAYER_PROMPT "
-    "set to your strategy, or field an explicit scripted baseline with "
+    "every seat opens twice. Field a model policy by reusing "
+    "/bin/negotiation-player with --use-llm --llm-model "
+    "anthropic/claude-haiku-4.5 and PLAYER_PROMPT set to your strategy, or "
+    "field an explicit scripted baseline with "
     "PLAYER_SCRIPTED=haggler|hardliner. The league ranks seats by mean "
     "episode score - the share of the pie they took - descending."
 )
@@ -189,11 +192,12 @@ the `matchEnd` event. It never appears in `results.reason`.
 
 POLICY_DOC = """# Writing a policy
 
-A policy is just a prompt. Upload the published player image with your
-strategy in `PLAYER_PROMPT`:
+A model policy reuses `/bin/negotiation-player` with the hosted LLM sidecar
+enabled and your strategy in `PLAYER_PROMPT`:
 
     coworld upload-policy <image> --name my-negotiator \\
       --run /bin/negotiation-player \\
+      --use-llm --llm-model anthropic/claude-haiku-4.5 \\
       --secret-env PLAYER_PROMPT="<your strategy>"
 
 ## What your prompt sees
@@ -223,23 +227,23 @@ schedule, or the policy name of any seat including its own.
      "message": "<= 200 characters", "notes": "<= 400 characters"}
     {"action": "accept", "message": "<= 200 characters", "notes": "<= 400 characters"}
 
-Replies must be a single JSON object with no surrounding prose or markdown
-fences. `action` must be `"offer"` or `"accept"`. For `"offer"`, `take` must
-be an object containing integer counts for all three keys (`books`, `hats`,
-`balls`) within pool bounds. `message` and `notes` are optional strings.
-Anything else - an alias, an array `take`, a string or fractional count,
-missing keys, an out-of-range count, `accept` on turn 1, or surrounding text -
-is an invalid reply.
+Replies must be a single JSON object (optionally wrapped in a single Markdown
+code fence) with no surrounding prose. `action` must be `"offer"` or
+`"accept"`. For `"offer"`, `take` must be an object containing integer counts
+for all three keys (`books`, `hats`, `balls`) within pool bounds. `message`
+and `notes` are optional strings. Anything else - an alias, an array `take`, a
+string or fractional count, missing keys, an out-of-range count, `accept` on
+turn 1, or surrounding text - is an invalid reply.
 
 Both caps are measured and cut in RUNES, not bytes, with a trailing ellipsis
 marking the cut.
 
 ## When a reply does not parse or fails
 
-An invalid or illegal model reply is retried ONCE with an appended hint line.
-A second failure, a transport error, a timeout, a refusal, or missing
-credentials ends the episode as an explicit policy failure via
-`COGAME_PLAYER_FAILURE_URI` with no scores published and original attempt
+Model seats make a single model call per turn with no retries or model
+fallback. An invalid or illegal reply, a transport error, a timeout, a
+refusal, or missing credentials ends the episode as an explicit policy failure
+via `COGAME_PLAYER_FAILURE_URI` with no scores published and original attempt
 evidence retained. No substitute or scripted fallback move is ever played for
 a model or external seat.
 
@@ -535,6 +539,19 @@ MANIFEST = {
     },
     "player": [
         player(
+            "negotiation-player",
+            "Negotiation Model Player",
+            "The canonical model-backed Negotiation Games policy: connects "
+            "with COWORLD_LLM_ENABLED=true and COWORLD_LLM_MODEL, calls the "
+            "routed model endpoint on every turn using PLAYER_PROMPT (or the "
+            "default bargaining strategy), and fails explicitly without "
+            "fallback or retries if model inference is unavailable or invalid.",
+            {
+                "COWORLD_LLM_ENABLED": "true",
+                "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+            },
+        ),
+        player(
             "negotiation-haggler",
             "Negotiation Haggler Baseline",
             "The scripted monotone-concession baseline as a fieldable policy: it "
@@ -581,10 +598,10 @@ MANIFEST = {
             "player_connect_timeout_seconds": 180,
         },
         # Every declared player[] entry must occupy a slot or certification
-        # fails players_missing (cogame-raid 0.1.3). Certification runs offline
-        # with explicit scripted players rather than fabricated LLM fallbacks.
+        # fails players_missing (cogame-raid 0.1.3). Explicitly seats the
+        # canonical model player alongside both scripted baselines.
         "players": [
-            {"player_id": "negotiation-haggler"},
+            {"player_id": "negotiation-player"},
             {"player_id": "negotiation-haggler"},
             {"player_id": "negotiation-hardliner"},
         ],

@@ -79,14 +79,37 @@ def main() -> int:
         check(player_id in seated,
               f"player {player_id!r} has no certification slot "
               "(certification would fail players_missing)")
+    model_players: list[str] = []
+    baseline_players: list[str] = []
     for entry in document.get("player") or []:
+        pid = entry.get("id")
         check(entry.get("image") == IMAGE_PLACEHOLDER,
-              f"player {entry.get('id')!r} image must be "
+              f"player {pid!r} image must be "
               f"{IMAGE_PLACEHOLDER}")
         limits = ((entry.get("resources") or {}).get("limits") or {})
         check(limits.get("cpu") == "1",
-              f"player {entry.get('id')!r} resources.limits.cpu must be "
+              f"player {pid!r} resources.limits.cpu must be "
               "\"1\" (a 500m limit is rejected at upload)")
+        penv = entry.get("env") or {}
+        check("COWORLD_LLM_ENDPOINT" not in penv,
+              f"player {pid!r} env must not contain COWORLD_LLM_ENDPOINT")
+        if penv.get("COWORLD_LLM_ENABLED") == "true":
+            check(bool(penv.get("COWORLD_LLM_MODEL")),
+                  f"model player {pid!r} must declare COWORLD_LLM_MODEL")
+            check(not penv.get("PLAYER_SCRIPTED"),
+                  f"model player {pid!r} must not set PLAYER_SCRIPTED")
+            model_players.append(pid)
+        elif penv.get("PLAYER_SCRIPTED") in ("haggler", "hardliner"):
+            baseline_players.append(pid)
+    check(len(model_players) >= 1,
+          "manifest must declare at least one ordinary model player with "
+          "COWORLD_LLM_ENABLED=true and COWORLD_LLM_MODEL")
+    check(len(baseline_players) >= 1,
+          "manifest must declare explicit scripted baseline opponents")
+    check(any(pid in seated for pid in model_players),
+          "certification.players must explicitly seat a model player")
+    check(any(pid in seated for pid in baseline_players),
+          "certification.players must explicitly seat baseline opponents")
 
     # ---- game block --------------------------------------------------------
     check(game.get("name") == GAME_NAME,
@@ -116,6 +139,8 @@ def main() -> int:
     env = game["runnable"]["env"]
     check("ANTHROPIC_API_KEY_URI" not in env,
           "hosted games must not request a provider secret")
+    check("COWORLD_LLM_ENDPOINT" not in env,
+          "published manifest must not contain COWORLD_LLM_ENDPOINT")
 
     # ---- config_schema: every array property is bounded -------------------
     schema = game.get("config_schema") or {}

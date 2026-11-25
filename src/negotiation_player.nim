@@ -1,21 +1,21 @@
-## Negotiation Games player: a policy is just a prompt.
+## Negotiation Games player: canonical model player and explicit baselines.
 ##
-## Connects to the game, delivers its prompt (from PLAYER_PROMPT, or a
-## default bargaining strategy), then idles until the final frame. All of
-## the actual decision making happens inside the game server, which sends
-## this seat's prompt to Claude whenever the seat has to offer or accept.
-##
-## PLAYER_SCRIPTED=haggler|hardliner registers the seat as one of the
-## built-in baselines instead: the server plays it deterministically, no
-## LLM.
-##
-## To field your own policy, reuse this image and set PLAYER_PROMPT:
-##   coworld upload-policy <image> --name my-negotiator \
-##     --run /bin/negotiation-player \
-##     --secret-env PLAYER_PROMPT="<your strategy>"
+## Modes:
+## 1. Explicit scripted baseline (`PLAYER_SCRIPTED=haggler|hardliner`):
+##    registers the chosen deterministic baseline with the server (no LLM).
+## 2. Player-side model policy (`COWORLD_LLM_ENABLED=true` or model endpoint/
+##    credentials routed to this container): registers `control: "external"`
+##    with its operator prompt, receives per-turn observations from the game
+##    server, makes a single model call to `COWORLD_LLM_ENDPOINT` with
+##    `COWORLD_LLM_MODEL`, and returns the canonical action with raw attempt
+##    evidence (or reports explicit failure without fallback or retries).
+## 3. Server-side prompt policy (no `PLAYER_SCRIPTED`, no player-side LLM env):
+##    delivers `PLAYER_PROMPT` so the game server invokes its own LLM client.
 
 import
   std/[json, options, os, strutils],
+  bitworld/decision_trajectory,
+  negotiation/[llm, sim],
   whisky
 
 const DefaultPrompt = """
@@ -29,6 +29,61 @@ last turn available to you, accept anything worth 1 or more: a deal you
 dislike still beats the zero that both of you get when the turns run out.
 """
 
+proc playerOwnsModelCalls(scripted: string): bool =
+  if scripted.len > 0:
+    return false
+  if getEnv("COWORLD_LLM_ENABLED").strip().toLowerAscii() == "true":
+    return true
+  for key in [
+    "COWORLD_LLM_ENDPOINT",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_API_KEY_URI",
+    "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+    "AWS_BEARER_TOKEN_BEDROCK",
+  ]:
+    if getEnv(key).strip().len > 0:
+      return true
+  false
+
+proc handleObservation(socket: WebSocket, client: LlmClient, payload: JsonNode) =
+  let eventId = payload{"event"}.getInt(-1)
+  if eventId < 0:
+    return
+  if client.isNil or client.disabled:
+    socket.send($ %*{
+      "type": "action_failed",
+      "event": eventId,
+      "reason": "LLM transport unavailable or unauthenticated for model seat",
+      "status": "missing"
+    })
+    return
+  let inputNode = payload{"input"}
+  let system = if not inputNode.isNil: inputNode{"system"}.getStr() else: ""
+  let user = if not inputNode.isNil: inputNode{"user"}.getStr() else: ""
+  var evidence = newDecisionAttempt("attempt-0", client.model, aoModel)
+  var raw = ""
+  try:
+    raw = client.completeText(system, user, -1, evidence)
+    let actionPayload = parseJsonObject(raw)
+    evidence.response = %raw
+    socket.send($ %*{
+      "type": "action",
+      "event": eventId,
+      "action": actionPayload,
+      "attempts": [attemptEvidenceJson(evidence)]
+    })
+  except CatchableError as error:
+    evidence.response = %raw
+    evidence.rejectionReason = some(error.msg)
+    echo "negotiation player: model decision failed: ", error.msg
+    socket.send($ %*{
+      "type": "action_failed",
+      "event": eventId,
+      "reason": error.msg,
+      "status": "rejected",
+      "attempts": [attemptEvidenceJson(evidence)]
+    })
+
 when isMainModule:
   let url = getEnv("COWORLD_PLAYER_WS_URL")
   if url.len == 0:
@@ -37,15 +92,25 @@ when isMainModule:
   if prompt.len == 0:
     prompt = DefaultPrompt
   let scripted = getEnv("PLAYER_SCRIPTED").strip()
+  let externalModel = playerOwnsModelCalls(scripted)
+  let client = if externalModel: newLlmClient(defaultGameConfig()) else: nil
 
-  proc promptFrame(): string =
-    $ %*{"type": "prompt", "prompt": prompt, "scripted": scripted}
+  proc registrationFrame(): string =
+    if externalModel:
+      $ %*{"type": "register", "control": "external", "prompt": prompt}
+    else:
+      $ %*{"type": "prompt", "prompt": prompt, "scripted": scripted}
 
   echo "negotiation player: connecting to game"
   let socket = newWebSocket(url)
-  socket.send(promptFrame())
-  echo "negotiation player: prompt delivered (", prompt.len, " chars",
-    (if scripted.len > 0: ", scripted " & scripted else: ""), ")"
+  socket.send(registrationFrame())
+  if externalModel:
+    echo "negotiation player: registered external model seat (model ",
+      (if not client.isNil: client.model else: ""), ", disabled=",
+      (if not client.isNil: $client.disabled else: "true"), ")"
+  else:
+    echo "negotiation player: prompt delivered (", prompt.len, " chars",
+      (if scripted.len > 0: ", scripted " & scripted else: ""), ")"
 
   ## whisky's receiveMessage RAISES on a close frame or a truncated read
   ## (only a timeout returns none), and the game's quit(0) can outrun the
@@ -66,9 +131,12 @@ when isMainModule:
         of "welcome":
           echo "negotiation player: seated at slot ",
             payload{"slot"}.getInt(), " as ", payload{"name"}.getStr()
-          ## Re-deliver the prompt after the welcome, in case the first send
+          ## Re-deliver registration after the welcome, in case the first send
           ## raced the server's slot registration.
-          socket.send(promptFrame())
+          socket.send(registrationFrame())
+        of "observation":
+          if externalModel:
+            handleObservation(socket, client, payload)
         of "final":
           echo "negotiation player: final scores ", payload{"scores"}
           break

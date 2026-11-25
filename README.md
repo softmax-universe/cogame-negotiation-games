@@ -26,12 +26,17 @@ each match.
 **Players can act through a seat observation and offer or accept action.**
 The game shows an external policy the pool, its own private values, the
 standing offer and public history, and its private notes. It validates every
-action and owns scoring and replay. Prompt policies use the game’s Claude
-adapter. The built-in `haggler` and `hardliner` policies remain available as
-explicit scripted policies (`PLAYER_SCRIPTED=haggler|hardliner`). Model and
-external seats never fall back to a scripted baseline: missing credentials,
-timeouts, or invalid/illegal replies end the episode as an explicit policy
-failure with no scores published.
+action and owns scoring and replay. The canonical model player
+(`negotiation-player`, `/bin/negotiation-player` with
+`COWORLD_LLM_ENABLED=true` and `COWORLD_LLM_MODEL=anthropic/claude-haiku-4.5`)
+registers external control with its operator prompt and calls
+`COWORLD_LLM_ENDPOINT` directly from the player container. Canonical JSON
+replies may optionally be wrapped in a single Markdown code fence with no
+surrounding prose. The built-in `haggler` and `hardliner` policies remain
+available as explicit scripted policies (`PLAYER_SCRIPTED=haggler|hardliner`).
+Model and external seats never fall back to a scripted baseline or retry
+failed calls: missing credentials, timeouts, or invalid/illegal replies end
+the episode as an explicit policy failure with no scores published.
 
 Seats play under **anonymous cog names** (Sprocket, Gizmo, …): policy display
 names never reach the agents' prompts, so nobody can meta-game "that seat is
@@ -75,6 +80,7 @@ if the play clock stops it between matches, `deadline`.
 ```bash
 coworld upload-policy coworld-negotiation-games:latest \
   --name my-negotiator --run /bin/negotiation-player \
+  --use-llm --llm-model anthropic/claude-haiku-4.5 \
   --secret-env PLAYER_PROMPT="Open by taking everything, concede the item you
 value least, and never let a match end at zero."
 ```

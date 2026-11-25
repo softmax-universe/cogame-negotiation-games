@@ -41,9 +41,11 @@
 #                              only replay in CI that is known to be readable
 #                              by this game's own viewer.
 #   SMOKE_GAME_LOG_OUT         optional path for the game log after a pass
-#   ANTHROPIC_API_KEY          if set, forwarded to the game so the LLM path
-#                              is exercised; if unset the game must fall back
-#                              to its scripted baselines and still complete
+#   COWORLD_LLM_ENDPOINT       optional model endpoint forwarded to model
+#                              player seats; if unset (along with
+#                              ANTHROPIC_API_KEY), a deterministic local HTTP
+#                              fixture is started for credential-free CI only
+#   ANTHROPIC_API_KEY          optional key forwarded to model seats when set
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,7 +71,11 @@ network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
 
+mock_pid=""
 cleanup() {
+  if [ -n "${mock_pid}" ]; then
+    kill "${mock_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -186,8 +192,9 @@ extra_env = [kv for kv in (os.environ.get("SMOKE_EXTRA_ENV") or "").split() if "
 for slot in range(seats):
     player_id = cert_players[slot].get("player_id") if slot < len(cert_players) else None
     entry = by_id.get(player_id) or {}
+    env_map = dict(entry.get("env") or {})
     env_args = []
-    for key, value in (entry.get("env") or {}).items():
+    for key, value in env_map.items():
         env_args += ["-e", f"{key}={value}"]
     for kv in extra_env:
         env_args += ["-e", kv]
@@ -196,6 +203,8 @@ for slot in range(seats):
         fh.write(" ".join(shlex.quote(a) for a in env_args))
     with open(os.path.join(work, f"cmd-{slot}.args"), "w") as fh:
         fh.write(" ".join(shlex.quote(a) for a in argv))
+    with open(os.path.join(work, f"llm-{slot}"), "w") as fh:
+        fh.write("1" if env_map.get("COWORLD_LLM_ENABLED") == "true" else "0")
     print(f"slot {slot}: player_id={player_id or '(default)'} run={argv} env={len(env_args) // 2}")
 
 with open(os.path.join(work, "seats"), "w") as fh:
@@ -212,11 +221,33 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+model_player_env=()
+model_player_docker_args=()
+needs_model_fixture=0
+for ((slot = 0; slot < seats; slot++)); do
+  if [ "$(cat "${work_dir}/llm-${slot}")" = "1" ]; then
+    needs_model_fixture=1
+  fi
+done
+
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  model_player_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  echo "COWORLD_LLM_ENDPOINT present: forwarding to model player seats"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
-  echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
-else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  model_player_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
+  echo "ANTHROPIC_API_KEY present: forwarding to game and model player seats"
+elif [ "${needs_model_fixture}" = "1" ]; then
+  mock_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("0.0.0.0",0)); print(s.getsockname()[1]); s.close()')"
+  python3 "${repo_dir}/tools/ci/mock_llm_server.py" --host 0.0.0.0 --port "${mock_port}" >"${work_dir}/mock_llm.log" 2>&1 &
+  mock_pid=$!
+  for _ in $(seq 1 40); do
+    if curl -fsS -o /dev/null "http://127.0.0.1:${mock_port}/healthz"; then break; fi
+    sleep 0.1
+  done
+  model_player_docker_args+=(--add-host=host.docker.internal:host-gateway)
+  model_player_env+=(-e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${mock_port}")
+  echo "started credential-free CI mock LLM fixture on port ${mock_port} for model player seats"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
@@ -235,7 +266,13 @@ docker run -d --name "${prefix}-game" \
 for ((slot = 0; slot < seats; slot++)); do
   eval "penv=( $(cat "${work_dir}/env-${slot}.args") )"
   eval "pcmd=( $(cat "${work_dir}/cmd-${slot}.args") )"
+  slot_docker_args=()
+  if [ "$(cat "${work_dir}/llm-${slot}")" = "1" ]; then
+    slot_docker_args+=(${model_player_docker_args[@]+"${model_player_docker_args[@]}"})
+    penv+=(${model_player_env[@]+"${model_player_env[@]}"})
+  fi
   docker run -d --name "${prefix}-p${slot}" --network "${network}" \
+    ${slot_docker_args[@]+"${slot_docker_args[@]}"} \
     -e COWORLD_PLAYER_WS_URL="ws://${prefix}-game:${port}/player?slot=${slot}&token=token-${slot}" \
     ${penv[@]+"${penv[@]}"} \
     "${image}" ${pcmd[@]+"${pcmd[@]}"} >/dev/null
