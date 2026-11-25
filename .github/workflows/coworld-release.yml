@@ -65,7 +65,7 @@ env:
   #   (seen: cogame-walker-waterworld release run 32962660196, 2026-08-26).
   # 0.1.34 unconditionally prints "Replay liveness: verified ...", so the
   # certify gate can never pass on it. Do not pin lower.
-  COWORLD_PKG: "coworld[auth]==0.1.56"
+  COWORLD_PKG: "coworld[auth]==0.1.69"
   LIVENESS_MARKER: "Replay liveness: skipped (static replay bundle declared"
 
 jobs:
@@ -323,12 +323,41 @@ jobs:
           PY
 
       - name: Upload the Coworld
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           echo "Upload the Coworld" > "$RR/current_step"
+          python3 - dist/coworld_manifest.json "$RR/upload_patch.json" "$RR/image_args.txt" "${IMAGE}:latest" <<'PY'
+          import copy, json, sys
+          src, patch_out, image_args_out, image = sys.argv[1:5]
+          doc = json.load(open(src))
+          game_env = ((doc.get("game") or {}).get("runnable") or {}).get("env") or {}
+          assert "COWORLD_LLM_ENDPOINT" not in game_env, "published game env must not set COWORLD_LLM_ENDPOINT"
+          for entry in doc.get("player") or []:
+              assert "COWORLD_LLM_ENDPOINT" not in (entry.get("env") or {}), "published player env must not set COWORLD_LLM_ENDPOINT"
+          patch = copy.deepcopy(doc)
+          # Preserve the already-uploaded static replay viewer bundle digest from --from-coworld.
+          if isinstance(patch.get("game"), dict):
+              patch["game"].pop("replay_viewer", None)
+          json.dump(patch, open(patch_out, "w"), indent=2)
+          args = [f"game={image}"]
+          for entry in doc.get("player") or []:
+              args.append(f"player.{entry['id']}={image}")
+          with open(image_args_out, "w") as fh:
+              for arg in args:
+                  fh.write(arg + "\n")
+          PY
+          image_flags=()
+          while IFS= read -r spec; do
+            [ -n "$spec" ] && image_flags+=(--image "$spec")
+          done < "$RR/image_args.txt"
           set +e
           uvx --from "$COWORLD_PKG" coworld upload-coworld \
-            dist/coworld_manifest.json \
+            --from-coworld "$SLUG" \
+            --version "$VERSION" \
+            --patch "$RR/upload_patch.json" \
+            "${image_flags[@]}" \
             --timeout-seconds 900 \
             --wait-hosted-smoke \
             --wait-certification \
