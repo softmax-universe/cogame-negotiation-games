@@ -100,7 +100,6 @@ type
     payoff*: array[2, int]
     points*, matchesPlayed*, deals*: array[Seats, int]
     given*, taken*: array[Seats, int]  ## for giveaway: opponent's u and own u, summed
-    fallbacks*: array[Seats, int]
     notes*: seq[string]                ## latest private notes per seat
     done*: bool
     reason*: string                    ## "complete" | "deadline"
@@ -533,9 +532,6 @@ proc endEarly*(sim: var Sim) =
   ## long one that never lands. Scores use the matches actually settled.
   sim.settle("deadline")
 
-proc recordFallback*(sim: var Sim, seat: int) =
-  inc sim.fallbacks[seat]
-
 # ---- Results ----------------------------------------------------------------
 
 proc resultsJson*(sim: Sim): JsonNode =
@@ -545,7 +541,6 @@ proc resultsJson*(sim: Sim): JsonNode =
   var matches = newJArray()
   var deals = newJArray()
   var giveaways = newJArray()
-  var fallbacks = newJArray()
   for seat in 0 ..< Seats:
     ## Results are platform-facing: the league attributes scores by POLICY
     ## name, not by the anonymous alias the seat played under.
@@ -555,7 +550,6 @@ proc resultsJson*(sim: Sim): JsonNode =
     matches.add(%sim.matchesPlayed[seat])
     deals.add(%sim.deals[seat])
     giveaways.add(%sim.giveaway(seat))
-    fallbacks.add(%sim.fallbacks[seat])
   %*{
     "names": names,
     "scores": scores,
@@ -563,7 +557,6 @@ proc resultsJson*(sim: Sim): JsonNode =
     "matches": matches,
     "deals": deals,
     "giveaway": giveaways,
-    "fallbacks": fallbacks,
     "matchesPlayed": sim.matchesSettled,
     "maxMatches": sim.config.matches,
     "reason": (if sim.done: sim.reason else: "")
@@ -630,7 +623,6 @@ proc tableStateJson*(sim: Sim): JsonNode =
       "matches": sim.matchesPlayed[seat],
       "deals": sim.deals[seat],
       "giveaway": sim.giveaway(seat),
-      "fallbacks": sim.fallbacks[seat],
       "role": sim.roleOf(seat),
       "notes": sim.notes[seat]
     })

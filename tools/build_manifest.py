@@ -36,10 +36,12 @@ PLAYER_PROTOCOL = (
     'authenticated slot and token. Welcome carries protocol, slot, anonymous name, matches, '
     "and maxTurns. State frames expose only that seat's tallies and episode progress; policy "
     "names and other seats' private information are excluded. Final frames carry scores, "
-    'points, deals, anonymous names, matchesPlayed, reason, and slot; players then exit. '
-    'Prompt policies send {"type":"prompt","prompt":str,"scripted":str|bool}; the game makes '
-    'model calls using the latest operator guidance. PLAYER_PROMPT supplies guidance, and '
-    'PLAYER_SCRIPTED selects haggler or hardliner. Prompts are capped at 4000 characters. '
+    'points, deals, anonymous names, matchesPlayed, reason, and slot; failed frames carry '
+    'failedSeat, reason, and slot; players then exit. '
+    'Prompt policies send {"type":"prompt","prompt":str,"scripted":str}; the game makes '
+    'model calls using the latest operator guidance when scripted is empty. PLAYER_PROMPT '
+    'supplies guidance, and PLAYER_SCRIPTED explicitly selects haggler or hardliner. Prompts '
+    'are capped at 4000 characters. '
     'External policies register {"type":"register","control":"external"}. Their turns receive'
     ' {"type":"observation","event":int,"observation":object,"prompt_configuration":{bank,var'
     'iant,selection,seed},"input":{"system":str,"user":str}}. The observation includes only '
@@ -49,15 +51,16 @@ PLAYER_PROTOCOL = (
     '{"action":"offer","take":{"books":int,"hats":int,"balls":int},"message":str,"notes":str}'
     ' or {"action":"accept","message":str,"notes":str}. Counts must fit the pool, and '
     'accepting requires a standing opponent offer. Game-owned prompt selection stays fixed '
-    'for the episode; operator guidance remains separate. The game owns legality, fallback, '
-    'scoring, and replay.'
+    'for the episode; operator guidance remains separate. The game owns legality, failure '
+    'handling, scoring, and replay; missing credentials, timeouts, or invalid/illegal replies '
+    'fail the episode explicitly without substituting a move or publishing scores.'
 )
 
 GLOBAL_PROTOCOL = (
     "Global spectators connect a websocket to /global and receive the full "
     "snapshot as JSON after every event: {\"type\":\"state\","
     "\"game\":\"negotiation-games\",\"seats\":[{name,score,points,matches,"
-    "deals,giveaway,fallbacks,role,notes} x3],\"match\":int,\"matches\":int,"
+    "deals,giveaway,role,notes} x3],\"match\":int,\"matches\":int,"
     "\"matchesPlayed\":int,\"kind\":\"bargaining\",\"itemNames\":[\"books\","
     "\"hats\",\"balls\"],\"table\":null|{\"a\":seat,\"b\":seat,"
     "\"opener\":seat,\"pool\":[3],\"values\":[[3],[3]],\"turn\":int,"
@@ -92,10 +95,9 @@ README = (
     "TO IT of what it ended up holding, out of 10; the turn cliff pays both "
     "sides zero. Six matches per episode, so every pairing plays twice and "
     "every seat opens twice. A policy is just a prompt: field one by "
-    "reusing the published negotiation-player runnable with PLAYER_PROMPT "
-    "set to your strategy. With no LLM credentials (or for seats that "
-    "register PLAYER_SCRIPTED=haggler|hardliner) the server plays a scripted "
-    "baseline, so episodes always complete. The league ranks seats by mean "
+    "reusing the published /bin/negotiation-player binary with PLAYER_PROMPT "
+    "set to your strategy, or field an explicit scripted baseline with "
+    "PLAYER_SCRIPTED=haggler|hardliner. The league ranks seats by mean "
     "episode score - the share of the pie they took - descending."
 )
 
@@ -221,34 +223,33 @@ schedule, or the policy name of any seat including its own.
      "message": "<= 200 characters", "notes": "<= 400 characters"}
     {"action": "accept", "message": "<= 200 characters", "notes": "<= 400 characters"}
 
-Parsing is tolerant in exactly these ways: `action` is matched
-case-insensitively after trimming (`accept|agree|deal` and
-`offer|propose|counter` are synonyms); `action` absent with `take` present
-means an offer; `take` may be the object above (missing keys are 0) or the
-3-element array `[books, hats, balls]`, with JSON integers or
-integer-valued strings. Anything else - a fractional count, an out-of-range
-count, `accept` on turn 1, an unknown action, no JSON object in the reply -
+Replies must be a single JSON object with no surrounding prose or markdown
+fences. `action` must be `"offer"` or `"accept"`. For `"offer"`, `take` must
+be an object containing integer counts for all three keys (`books`, `hats`,
+`balls`) within pool bounds. `message` and `notes` are optional strings.
+Anything else - an alias, an array `take`, a string or fractional count,
+missing keys, an out-of-range count, `accept` on turn 1, or surrounding text -
 is an invalid reply.
 
 Both caps are measured and cut in RUNES, not bytes, with a trailing ellipsis
 marking the cut.
 
-## When a reply does not parse
+## When a reply does not parse or fails
 
-An invalid or illegal reply is retried ONCE with an appended hint line. A
-second failure, a transport error, a timeout, a refusal or missing
-credentials falls back to the seat's scripted baseline, applied with
-`scripted: true`, and increments `results.fallbacks[seat]`. A seat that
-registered a prompt (or nothing) falls back to `haggler`. The scripted move
-is always legal, so the turn always advances.
+An invalid or illegal model reply is retried ONCE with an appended hint line.
+A second failure, a transport error, a timeout, a refusal, or missing
+credentials ends the episode as an explicit policy failure via
+`COGAME_PLAYER_FAILURE_URI` with no scores published and original attempt
+evidence retained. No substitute or scripted fallback move is ever played for
+a model or external seat.
 
 ## The two baselines
 
-Both are fieldable policies in their own right
-(`PLAYER_SCRIPTED=haggler|hardliner`). Let `t` be the turn, `T = maxTurns`,
-and `worth(x)` the bundle's value under this seat's own values.
+Both are explicit fieldable policies (`PLAYER_SCRIPTED=haggler|hardliner`).
+Let `t` be the turn, `T = maxTurns`, and `worth(x)` the bundle's value under
+this seat's own values.
 
-**haggler** - a monotone conceder, and the universal fallback.
+**haggler** - a monotone conceder.
 
 1. Reservation `R(t) = clamp(round(10 - 6 * (t - 1) / max(T - 1, 1)), 4, 10)`:
    10 on turn 1, decaying linearly to 4 on turn `T`.
@@ -447,7 +448,6 @@ MANIFEST = {
                 "matches",
                 "deals",
                 "giveaway",
-                "fallbacks",
                 "matchesPlayed",
                 "maxMatches",
                 "reason",
@@ -495,13 +495,6 @@ MANIFEST = {
                     "maxItems": SEATS,
                     "items": {"type": "number", "minimum": -10, "maximum": 10},
                 },
-                "fallbacks": {
-                    "description": "Turns on which this seat's model call was skipped or gave up and the scripted baseline moved instead.",
-                    "type": "array",
-                    "minItems": SEATS,
-                    "maxItems": SEATS,
-                    "items": {"type": "integer", "minimum": 0},
-                },
                 "matchesPlayed": {
                     "description": "Matches the table actually settled.",
                     "type": "integer",
@@ -541,14 +534,6 @@ MANIFEST = {
         },
     },
     "player": [
-        player(
-            "negotiation-player",
-            "Negotiation Prompt Player",
-            "The reference Negotiation Games policy: delivers its PLAYER_PROMPT "
-            "(or a default bargaining strategy) to the game and spectates until "
-            "the final frame. Field your own policy by uploading this same image "
-            "with a different PLAYER_PROMPT.",
-        ),
         player(
             "negotiation-haggler",
             "Negotiation Haggler Baseline",
@@ -596,9 +581,10 @@ MANIFEST = {
             "player_connect_timeout_seconds": 180,
         },
         # Every declared player[] entry must occupy a slot or certification
-        # fails players_missing (cogame-raid 0.1.3).
+        # fails players_missing (cogame-raid 0.1.3). Certification runs offline
+        # with explicit scripted players rather than fabricated LLM fallbacks.
         "players": [
-            {"player_id": "negotiation-player"},
+            {"player_id": "negotiation-haggler"},
             {"player_id": "negotiation-haggler"},
             {"player_id": "negotiation-hardliner"},
         ],

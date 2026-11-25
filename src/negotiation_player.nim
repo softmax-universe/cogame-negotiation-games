@@ -7,7 +7,7 @@
 ##
 ## PLAYER_SCRIPTED=haggler|hardliner registers the seat as one of the
 ## built-in baselines instead: the server plays it deterministically, no
-## LLM. `1|true|yes` also works and means `haggler`.
+## LLM.
 ##
 ## To field your own policy, reuse this image and set PLAYER_PROMPT:
 ##   coworld upload-policy <image> --name my-negotiator \
@@ -71,6 +71,10 @@ when isMainModule:
           socket.send(promptFrame())
         of "final":
           echo "negotiation player: final scores ", payload{"scores"}
+          break
+        of "failed":
+          echo "negotiation player: episode failed (seat ",
+            payload{"failedSeat"}.getInt(-1), "): ", payload{"reason"}.getStr()
           break
         else:
           discard

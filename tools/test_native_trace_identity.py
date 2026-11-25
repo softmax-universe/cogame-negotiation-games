@@ -90,32 +90,6 @@ def run(game, player, verifier, output, variant, seed):
             timeout=30,
         )
         (root / "verification.json").write_bytes(report)
-        # This new synthetic fixture checks the archived-format reader without
-        # altering any historical trace or granting it current source admission.
-        legacy = []
-        for line in (root / "trajectory.jsonl").read_text().splitlines():
-            row = json.loads(line)
-            row["game"] = "negotiation"
-            if row["event_type"] == "episode":
-                row["seed_family"] = str(seed)
-            if row["event_type"] == "decision":
-                selection = row["observation"]["prompt_configuration"]
-                row["observation"]["prompt_configuration"] = {
-                    "promptVariant": selection["selection"],
-                    "promptSeed": selection["seed"],
-                }
-            legacy.append(json.dumps(row))
-        (root / "legacy-fixture.jsonl").write_text("\n".join(legacy) + "\n")
-        subprocess.check_call(
-            [
-                str(verifier),
-                str(root / "replay.json"),
-                str(root / "legacy-fixture.jsonl"),
-                episode,
-            ],
-            timeout=30,
-            stdout=subprocess.DEVNULL,
-        )
         return summary["seed_family"]
     finally:
         for child in children:
@@ -140,7 +114,7 @@ def main():
     assert families["standard"] == families["sprint"]
     assert families["standard"][0] != families["standard"][1]
     (destination / "families.json").write_text(json.dumps(families, indent=2) + "\n")
-    print("four complete native games: catalog identity, prompt metadata, replay joins and legacy reader passed")
+    print("four complete native games: catalog identity, prompt metadata and replay joins passed")
 
 
 if __name__ == "__main__":

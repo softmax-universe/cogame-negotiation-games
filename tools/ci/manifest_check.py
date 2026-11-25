@@ -137,7 +137,7 @@ def main() -> int:
     # ---- results_schema ----------------------------------------------------
     results = game.get("results_schema") or {}
     for name in ("names", "scores", "points", "matches", "deals",
-                 "giveaway", "fallbacks"):
+                 "giveaway"):
         prop = (results.get("properties") or {}).get(name) or {}
         check(prop.get("minItems") == SEATS and prop.get("maxItems") == SEATS,
               f"results_schema.properties.{name} must be bounded to {SEATS}")

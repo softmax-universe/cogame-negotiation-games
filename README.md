@@ -26,9 +26,12 @@ each match.
 **Players can act through a seat observation and offer or accept action.**
 The game shows an external policy the pool, its own private values, the
 standing offer and public history, and its private notes. It validates every
-action and owns scoring and replay. Existing prompt policies use the game’s
-Claude adapter. The built-in `haggler` and `hardliner` policies remain
-available, and offline certification uses their scripted fallback.
+action and owns scoring and replay. Prompt policies use the game’s Claude
+adapter. The built-in `haggler` and `hardliner` policies remain available as
+explicit scripted policies (`PLAYER_SCRIPTED=haggler|hardliner`). Model and
+external seats never fall back to a scripted baseline: missing credentials,
+timeouts, or invalid/illegal replies end the episode as an explicit policy
+failure with no scores published.
 
 Seats play under **anonymous cog names** (Sprocket, Gizmo, …): policy display
 names never reach the agents' prompts, so nobody can meta-game "that seat is
@@ -39,8 +42,8 @@ policy names; results are reported under policy names.
 holds, 0..10 (a no-deal pays 0). Over the episode
 `score = points / (10 × matches played)`, in `[0, 1]`, **higher is better**;
 the league ranks seats by mean episode score. Results also carry `points`,
-`matches`, `deals`, `giveaway` (the mechanical softplay audit: the mean of
-*opponent's payoff − mine*) and `fallbacks`. The episode ends `complete` or,
+`matches`, `deals`, and `giveaway` (the mechanical softplay audit: the mean of
+*opponent's payoff − mine*). The episode ends `complete` or,
 if the play clock stops it between matches, `deadline`.
 
 ## Layout
@@ -80,7 +83,7 @@ value least, and never let a match end at zero."
 instead. Both entry points live in the same image.
 
 External policies use the same private seat observation and complete action
-path. The game owns legality, fallback, results, and replay.
+path. The game owns legality, failure handling, results, and replay.
 
 ## Local loop
 
@@ -115,7 +118,7 @@ against the bytes that episode produced.
 Set `COGAME_SAVE_TRAJECTORY_URI` alongside `COWORLD_EPISODE_ID`,
 `COWORLD_GAME_VERSION`, and the immutable `COWORLD_SOURCE_REVISION` to record
 private native decision JSONL. The engine records exact model attempts after
-applying actions, including rejected replies and scripted fallbacks. Keep this
+applying actions, including rejected replies and terminal failures. Keep this
 artifact separate from public replay; local trajectory files use mode 0600.
 
 `tools/export_native_posttrain.py --replay replay.json --trajectory trajectory.jsonl

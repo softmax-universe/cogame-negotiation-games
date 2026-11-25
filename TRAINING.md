@@ -57,19 +57,19 @@ observation frames. This fixes the old incomplete configuration object without
 changing rule wording, model requests, offers, acceptance, private values, notes,
 match budgets or outcomes.
 
-The source-owned replay verifier explicitly retains the archived `negotiation`
-name and raw prompt-selection format. It checks current canonical bank metadata
-and decision identity consistently. Stored traces and old failed admissions are
-not rewritten or granted new authority by this source correction. Recollect on a
-source-pinned certified release, independently join provider receipts and review
-physical/dependency families before preparing a learner.
+The source-owned replay verifier checks the canonical `negotiation-games`
+catalog identity and typed prompt-bank metadata consistently. Stored traces and
+old failed admissions are not rewritten or granted new authority by this source
+correction. Recollect on a source-pinned certified release, independently join
+provider receipts and review physical/dependency families before preparing a
+learner.
 
 The complete system check runs both ordinary manifest variants at two seeds through
 the actual game server and bundled reference players. It verifies typed prompt-bank
-metadata, executed actions and terminal replay scores, owner-readable private
-artifacts and legacy reader support. Its scripted fixture responses are software
-qualification, not real-model training data. Only spectator pacing is removed;
-match counts, turn limits and gameplay remain the ordinary native ones.
+metadata, executed actions and terminal replay scores, and owner-readable private
+artifacts. Its scripted fixture responses are software qualification, not real-model
+training data. Only spectator pacing is removed; match counts, turn limits and
+gameplay remain the ordinary native ones.
 
 ```sh
 nim c -d:release --path:src -o:/path/negotiation src/negotiation.nim
