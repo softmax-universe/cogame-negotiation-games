@@ -239,7 +239,8 @@ elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   echo "ANTHROPIC_API_KEY present: forwarding to game and model player seats"
 elif [ "${needs_model_fixture}" = "1" ]; then
   mock_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("0.0.0.0",0)); print(s.getsockname()[1]); s.close()')"
-  python3 "${repo_dir}/tools/ci/mock_llm_server.py" --host 0.0.0.0 --port "${mock_port}" >"${work_dir}/mock_llm.log" 2>&1 &
+  python3 "${repo_dir}/tools/ci/mock_llm_server.py" --host 0.0.0.0 --port "${mock_port}" \
+    --game-config "${work_dir}/config.json" >"${work_dir}/mock_llm.log" 2>&1 &
   mock_pid=$!
   for _ in $(seq 1 40); do
     if curl -fsS -o /dev/null "http://127.0.0.1:${mock_port}/healthz"; then break; fi

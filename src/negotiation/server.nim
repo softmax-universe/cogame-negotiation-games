@@ -644,7 +644,9 @@ proc playerUpgradeHandler(request: Request) {.gcsafe.} =
         "slot": slot,
         "name": state.sim.names[slot],
         "matches": state.config.matches,
-        "maxTurns": state.config.maxTurns
+        "maxTurns": state.config.maxTurns,
+        "maxOutputTokens": state.config.maxOutputTokens,
+        "llmTimeoutSeconds": state.config.llmTimeoutSeconds
       })
 
 proc globalUpgradeHandler(request: Request) {.gcsafe.} =

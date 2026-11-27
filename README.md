@@ -89,7 +89,8 @@ value least, and never let a match end at zero."
 instead. Both entry points live in the same image.
 
 External policies use the same private seat observation and complete action
-path. The game owns legality, failure handling, results, and replay.
+path. The game sends the episode’s output token limit and model-call timeout
+in the welcome frame. The game owns legality, failure handling, results, and replay.
 
 ## Local loop
 
