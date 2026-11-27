@@ -93,7 +93,7 @@ when isMainModule:
     prompt = DefaultPrompt
   let scripted = getEnv("PLAYER_SCRIPTED").strip()
   let externalModel = playerOwnsModelCalls(scripted)
-  let client = if externalModel: newLlmClient(defaultGameConfig()) else: nil
+  var client: LlmClient
 
   proc registrationFrame(): string =
     if externalModel:
@@ -105,9 +105,7 @@ when isMainModule:
   let socket = newWebSocket(url)
   socket.send(registrationFrame())
   if externalModel:
-    echo "negotiation player: registered external model seat (model ",
-      (if not client.isNil: client.model else: ""), ", disabled=",
-      (if not client.isNil: $client.disabled else: "true"), ")"
+    echo "negotiation player: registered external model seat"
   else:
     echo "negotiation player: prompt delivered (", prompt.len, " chars",
       (if scripted.len > 0: ", scripted " & scripted else: ""), ")"
@@ -131,6 +129,11 @@ when isMainModule:
         of "welcome":
           echo "negotiation player: seated at slot ",
             payload{"slot"}.getInt(), " as ", payload{"name"}.getStr()
+          if externalModel:
+            var config = defaultGameConfig()
+            config.maxOutputTokens = payload["maxOutputTokens"].getInt()
+            config.llmTimeoutSeconds = payload["llmTimeoutSeconds"].getInt()
+            client = newLlmClient(config)
           ## Re-deliver registration after the welcome, in case the first send
           ## raced the server's slot registration.
           socket.send(registrationFrame())

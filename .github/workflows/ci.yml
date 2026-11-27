@@ -214,7 +214,7 @@ jobs:
           # fixture (which has to fit `coworld certify`'s 60 s default). The
           # seat count still comes solely from
           # certification.game_config.num_agents.
-          SMOKE_CONFIG_JSON: '{"seed": 20260826, "matches": 6, "maxTurns": 10, "turnDelayMs": 0}'
+          SMOKE_CONFIG_JSON: '{"seed": 20260826, "matches": 6, "maxTurns": 10, "turnDelayMs": 0, "maxOutputTokens": 731}'
         run: ./tools/ci/docker_smoke.sh "${IMAGE}:ci"
 
       # Design note §Tests items 21 (game-specific half), 22 (strict-UTF-8

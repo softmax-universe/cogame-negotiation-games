@@ -66,6 +66,9 @@ class MockAnthropicHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
         payload = json.loads(raw.decode("utf-8"))
+        if self.server.expected_max_tokens is not None and payload.get("max_tokens") != self.server.expected_max_tokens:
+            self.send_error(400, "max_tokens differs from the episode configuration")
+            return
         model = payload.get("model") or "anthropic/claude-haiku-4.5"
         messages = payload.get("messages") or []
         user_text = ""
@@ -96,8 +99,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18089)
+    parser.add_argument("--game-config", type=argparse.FileType("r"))
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.host, args.port), MockAnthropicHandler)
+    server.expected_max_tokens = json.load(args.game_config).get("maxOutputTokens") if args.game_config else None
     try:
         server.serve_forever()
     except KeyboardInterrupt:
